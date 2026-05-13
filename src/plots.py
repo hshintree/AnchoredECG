@@ -542,7 +542,14 @@ def main():
     adapter = load_adapter(args.ckpt, device=device)
     adapter.eval()
 
-    u_va, _, zr_va, zs_va = build_tensors(val_split, device=device)
+    # Honor the zero_prior flag baked into the checkpoint's config so the
+    # plots use the same network input format as training.
+    ckpt_meta = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    zero_prior = bool((ckpt_meta.get("config") or {}).get("zero_prior", False))
+    if zero_prior:
+        print("  [mode] zero_prior=True  ->  u = [phi_stress; zeros(192)]")
+
+    u_va, _, zr_va, zs_va = build_tensors(val_split, device=device, zero_prior=zero_prior)
     with torch.no_grad():
         z_hat_va = (zr_va + adapter(u_va)).cpu().numpy()
     z_true_va = val_split["z_stress"]
@@ -551,7 +558,7 @@ def main():
     # Use a bounded sample of train for gate stats
     n = min(args.max_train_samples, len(train_split["z_rest"]))
     sub = {k: v[:n] for k, v in train_split.items()}
-    u_tr, *_ = build_tensors(sub, device=device)
+    u_tr, *_ = build_tensors(sub, device=device, zero_prior=zero_prior)
 
     # ---- figures ------------------------------------------------------------
     print("\n[1/7] neuron importance ...")

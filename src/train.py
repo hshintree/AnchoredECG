@@ -54,6 +54,11 @@ def parse_args():
                     help="Metric used to decide which iterate to checkpoint. "
                          "'latent_mse' = lowest val latent MSE wins (default); "
                          "'auroc' = highest val ischemia AUROC wins.")
+    ap.add_argument("--zero-prior", action="store_true",
+                    help="Ablation: feed the network u = [phi_stress; zeros(192)] "
+                         "instead of [phi_stress; z_rest]. The residual target "
+                         "r = z_stress - z_rest and inference-time anchoring "
+                         "z_hat = z_rest + r_hat are unchanged.")
     ap.add_argument("--eval-every", type=int, default=DEFAULT_CONFIG["eval_every"])
     ap.add_argument("--seeds", type=int, nargs="*", default=[42],
                     help="One seed -> single run. Multiple -> seed variance.")
@@ -73,6 +78,7 @@ def cfg_from_args(args) -> dict:
         "lambda_l2": args.lambda_l2,
         "lambda_l1": args.lambda_l1,
         "ckpt_metric": args.ckpt_metric,
+        "zero_prior": args.zero_prior,
         "eval_every": args.eval_every,
         "device": args.device,
     }
@@ -118,8 +124,11 @@ def main():
             print(f"  final val_auroc:      {history.val_auroc[-1]:.4f}")
         print(f"\nCheckpoint -> {args.ckpt}")
 
-        # Final-on-val report (single-seed)
-        u_va, r_va, zr_va, zs_va = build_tensors(val_split, device=device)
+        # Final-on-val report (single-seed). Match the training-time u-build
+        # so zero_prior models are evaluated on zero-prior inputs.
+        u_va, r_va, zr_va, zs_va = build_tensors(
+            val_split, device=device, zero_prior=cfg.get("zero_prior", False),
+        )
         final = evaluate_residual_adapter(
             adapter, u_va, r_va, zr_va, zs_va,
             head=head, y=val_split["ischemia"], bl_st80=val_split["bl_st80"],

@@ -49,6 +49,7 @@ DEFAULT_CONFIG = {
     "lambda_l2": 1e-4,       # L2 (weight decay) on trainable params
     "lambda_l1": 0.0,        # L1 penalty on linear1 (feature) weights
     "ckpt_metric": "latent_mse",  # "latent_mse" (lower=better) or "auroc" (higher=better)
+    "zero_prior": False,     # if True, network input is [phi; zeros(192)] (no rest prior)
     "device": None,          # None -> auto-detect cuda/mps/cpu
 }
 
@@ -131,13 +132,24 @@ def load_split(data_dir: Path | str, name: str) -> dict:
     return {k: d[k] for k in d.files}
 
 
-def build_tensors(split: dict, device: torch.device | None = None
+def build_tensors(split: dict, device: torch.device | None = None,
+                  zero_prior: bool = False
                   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build (U, R, z_rest, z_stress) tensors from a split dict."""
+    """Build (U, R, z_rest, z_stress) tensors from a split dict.
+
+    If `zero_prior=True`, the z_rest half of the network input is replaced
+    by zeros so the model can only condition on phi_stress (the single
+    stressed-lead embedding). The target r = z_stress - z_rest and the
+    z_rest variable returned for inference-time anchoring are unchanged.
+    """
     phi = torch.from_numpy(split["phi_stress"]).float()
     z_rest = torch.from_numpy(split["z_rest"]).float()
     z_stress = torch.from_numpy(split["z_stress"]).float()
-    u = torch.cat([phi, z_rest], dim=1)
+    if zero_prior:
+        prior_in = torch.zeros_like(z_rest)
+    else:
+        prior_in = z_rest
+    u = torch.cat([phi, prior_in], dim=1)
     r = z_stress - z_rest
     if device is not None:
         u, r, z_rest, z_stress = (t.to(device) for t in (u, r, z_rest, z_stress))
@@ -295,10 +307,14 @@ def train_grelu_adapter(
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     device = pick_device(cfg["device"])
     torch.manual_seed(cfg["seed"])
+    zero_prior = bool(cfg.get("zero_prior", False))
+    if zero_prior:
+        print("  [mode] zero_prior=True  ->  u = [phi_stress; zeros(192)]")
 
-    u_tr, r_tr, _, _ = build_tensors(train_split, device=device)
+    u_tr, r_tr, _, _ = build_tensors(train_split, device=device, zero_prior=zero_prior)
     if val_split is not None:
-        u_va, r_va, zr_va, zs_va = build_tensors(val_split, device=device)
+        u_va, r_va, zr_va, zs_va = build_tensors(val_split, device=device,
+                                                 zero_prior=zero_prior)
         y_va = val_split.get("ischemia")
         bl_va = val_split.get("bl_st80")
 
