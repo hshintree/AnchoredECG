@@ -89,6 +89,38 @@ def per_dim_cosine(z_hat: np.ndarray, z_true: np.ndarray) -> np.ndarray:
     return num / den
 
 
+def precision_at_sensitivity(scores: np.ndarray, labels: np.ndarray,
+                              target_sens: float = 0.80) -> float:
+    """Precision (PPV) at the operating point that achieves >= `target_sens` recall.
+
+    Walks the ROC, picks the threshold where sensitivity (TPR) first reaches the
+    target, returns precision at that threshold. NaN if not reachable.
+    """
+    from sklearn.metrics import precision_recall_curve
+    prec, rec, _ = precision_recall_curve(labels, scores)
+    # precision_recall_curve returns prec/rec sorted by ascending threshold,
+    # which corresponds to recall going from 1 -> 0 (last point is recall=0).
+    # Find points where recall >= target_sens, pick the max precision among them.
+    mask = rec >= target_sens
+    if not mask.any():
+        return float("nan")
+    return float(prec[mask].max())
+
+
+def per_lead_delta_pearson(z_hat: np.ndarray, z_true: np.ndarray,
+                           bl_st80: np.ndarray, head) -> np.ndarray:
+    """Pearson r per lead between predicted dST80 and true dST80 (stress-rest)."""
+    pred_d = decode_st80(head, z_hat) - bl_st80
+    true_d = decode_st80(head, z_true) - bl_st80
+    out = np.zeros(pred_d.shape[1])
+    for k in range(pred_d.shape[1]):
+        ak = pred_d[:, k] - pred_d[:, k].mean()
+        bk = true_d[:, k] - true_d[:, k].mean()
+        den = (np.linalg.norm(ak) * np.linalg.norm(bk)) + 1e-12
+        out[k] = float((ak * bk).sum() / den)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Individual figures
 # ---------------------------------------------------------------------------
@@ -337,15 +369,14 @@ def plot_st80_per_lead_pearson(z_hat: np.ndarray, z_true: np.ndarray,
           f"max = {rho_delta.max():.3f} ({LEAD_NAMES[rho_delta.argmax()]})")
 
 
-def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, metric: str = "val_latent_mse",
-                       also_auroc: bool = True, min_runs: int = 5,
+def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, min_runs: int = 5,
                        include_configs: list[str] | None = None,
                        include_methods: list[str] | None = None):
-    """Side-by-side box plots of sweep results, grouped by (method, config).
+    """AUROC box plot of sweep results, grouped by (method, config).
 
     Reads JSONL records written by `nonconvex_MLP.py` and `grelu_sweep.py`,
-    groups by `method` -> `config`, and shows distribution across the
-    hyperparameter grid.
+    groups by `method` -> `config`, and shows the val AUROC distribution
+    across the hyperparameter grid (one point per hyperparameter combo).
 
     The JSONL is append-only, so old / legacy / partial sweeps can leave
     stale records around. To suppress those, configs with fewer than
@@ -353,6 +384,7 @@ def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, metric: str = "val_late
     `include_methods` to override.
     """
     import matplotlib.pyplot as plt
+    metric = "val_auroc"
 
     if not jsonl_path.exists():
         print(f"  (skipping sweep box plot: {jsonl_path} not found -- "
@@ -422,37 +454,17 @@ def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, metric: str = "val_late
     n_per = max(len(v) for v in box_data)
     colors = ["#4C72B0" if m == "GReLU" else "#DD8452" for m, _ in keys]
 
-    if also_auroc:
-        au_data = [[r["val_auroc"] for r in grouped[k]] for k in keys]
-        fig, axs = plt.subplots(1, 2, figsize=(max(11, len(keys) * 1.2), 5))
-    else:
-        au_data = None
-        fig, axs = plt.subplots(1, 1, figsize=(max(7, len(keys) * 1.2), 5))
-        axs = [axs]
-
-    bp1 = axs[0].boxplot(box_data, tick_labels=labels, patch_artist=True, widths=0.6)
-    for patch, color in zip(bp1["boxes"], colors):
+    fig, ax = plt.subplots(1, 1, figsize=(max(7, len(keys) * 1.2), 5))
+    bp = ax.boxplot(box_data, tick_labels=labels, patch_artist=True, widths=0.6)
+    for patch, color in zip(bp["boxes"], colors):
         patch.set_facecolor(color); patch.set_alpha(0.75)
-    # Overlay individual seed points
     for i, runs in enumerate(box_data, start=1):
         x = np.full(len(runs), i, dtype=float) + np.random.uniform(-0.08, 0.08, size=len(runs))
-        axs[0].plot(x, runs, "o", color="black", markersize=4, alpha=0.7)
-    axs[0].set_title(f"Val {metric}  (n={n_per} hp-combos per config)")
-    axs[0].set_ylabel(metric)
-    axs[0].grid(True, axis="y", alpha=0.3)
-    axs[0].tick_params(axis="x", rotation=0)
-
-    if au_data is not None:
-        bp2 = axs[1].boxplot(au_data, tick_labels=labels, patch_artist=True, widths=0.6)
-        for patch, color in zip(bp2["boxes"], colors):
-            patch.set_facecolor(color); patch.set_alpha(0.75)
-        for i, runs in enumerate(au_data, start=1):
-            x = np.full(len(runs), i, dtype=float) + np.random.uniform(-0.08, 0.08, size=len(runs))
-            axs[1].plot(x, runs, "o", color="black", markersize=4, alpha=0.7)
-        axs[1].set_title(f"Val AUROC  (n={n_per} hp-combos per config)")
-        axs[1].set_ylabel("AUROC")
-        axs[1].grid(True, axis="y", alpha=0.3)
-        axs[1].tick_params(axis="x", rotation=0)
+        ax.plot(x, runs, "o", color="black", markersize=4, alpha=0.7)
+    ax.set_title(f"Val AUROC  (n={n_per} hp-combos per config)")
+    ax.set_ylabel("AUROC")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.tick_params(axis="x", rotation=0)
 
     from matplotlib.patches import Patch
     legend_handles = [
@@ -464,12 +476,109 @@ def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, metric: str = "val_late
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    # Print a quick summary
     print(f"  configs: {len(keys)}   total runs: {sum(len(v) for v in box_data)}")
     for k, runs in zip(keys, box_data):
         arr = np.array(runs)
-        print(f"    {k[0]:<6s} {k[1]:<10s}  {metric}: {arr.mean():.4f} "
+        print(f"    {k[0]:<6s} {k[1]:<10s}  val_auroc: {arr.mean():.4f} "
               f"+/- {arr.std():.4f}   n={len(arr)}")
+
+
+def plot_model_comparison(preds: dict[str, np.ndarray], z_true: np.ndarray,
+                          val_split: dict, head, out_path: Path,
+                          target_sens: float = 0.80):
+    """Compare AUROC, precision-at-target-sensitivity, AUPRC, and per-lead
+    Pearson across multiple models.
+
+    Args:
+        preds: ordered dict mapping label -> z_hat (N, 192) on val.
+        z_true: (N, 192) ground-truth stress latent.
+        val_split: dict with bl_st80, ischemia.
+        head: ST80 regression head.
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    from adapter_interface import TERRITORIES
+
+    labels = list(preds.keys())
+    bl_st80 = val_split["bl_st80"]
+    y = val_split["ischemia"]
+
+    aurocs, auprcs, precs, rho_per_lead = [], [], [], []
+    print(f"  Scoring {len(labels)} models on val (sens target = {target_sens:.0%}) ...")
+    for name in labels:
+        z_hat = preds[name]
+        pred_st80 = decode_st80(head, z_hat)
+        scores = ischemia_patient_score(pred_st80, bl_st80)
+        if len(np.unique(y)) >= 2:
+            auroc = float(roc_auc_score(y, scores))
+            auprc = float(average_precision_score(y, scores))
+            prec = precision_at_sensitivity(scores, y, target_sens)
+        else:
+            auroc = auprc = prec = float("nan")
+        aurocs.append(auroc); auprcs.append(auprc); precs.append(prec)
+        rho_per_lead.append(per_lead_delta_pearson(z_hat, z_true, bl_st80, head))
+        print(f"    {name:<22s}  auroc={auroc:.4f}  auprc={auprc:.4f}  "
+              f"prec@sens{target_sens:.0%}={prec:.4f}  "
+              f"mean_lead_rho={rho_per_lead[-1].mean():.3f}")
+
+    # Stable colors per model
+    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860"]
+    colors = [palette[i % len(palette)] for i in range(len(labels))]
+
+    # Layout: 2x2 grid -- top row 3 panels (AUROC, Prec, AUPRC), bottom row per-lead Pearson
+    fig = plt.figure(figsize=(15, 9))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1.2])
+    axA = fig.add_subplot(gs[0, 0])
+    axP = fig.add_subplot(gs[0, 1])
+    axQ = fig.add_subplot(gs[0, 2])
+    axL = fig.add_subplot(gs[1, :])
+
+    def _bar(ax, values, title, ylim=None):
+        x = np.arange(len(values))
+        bars = ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.5)
+        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha="right")
+        ax.set_title(title); ax.grid(True, axis="y", alpha=0.3)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        for b, v in zip(bars, values):
+            if v != v:  # NaN
+                ax.text(b.get_x() + b.get_width() / 2, 0.02, "N/A",
+                        ha="center", va="bottom", fontsize=8)
+                continue
+            ax.text(b.get_x() + b.get_width() / 2, v + 0.005,
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+
+    _bar(axA, aurocs, "Ischemia AUROC (val)", ylim=(0.5, 1.0))
+    _bar(axP, precs,  f"Precision @ sensitivity={target_sens:.0%} (val)", ylim=(0.0, 1.0))
+    _bar(axQ, auprcs, "Ischemia AUPRC (val)", ylim=(0.0, 1.0))
+
+    # Per-lead clustered bars
+    n_models = len(labels)
+    n_leads = rho_per_lead[0].shape[0]
+    width = 0.8 / max(n_models, 1)
+    x = np.arange(n_leads)
+    for i, (name, rho) in enumerate(zip(labels, rho_per_lead)):
+        xpos = x + (i - (n_models - 1) / 2) * width
+        axL.bar(xpos, rho, width=width, color=colors[i], edgecolor="black",
+                linewidth=0.3, label=f"{name}  (mean r = {rho.mean():.3f})")
+    axL.set_xticks(x); axL.set_xticklabels(LEAD_NAMES)
+    axL.set_ylabel("Pearson r")
+    axL.set_title("Per-lead Pearson r:  predicted dST80 vs true dST80")
+    axL.axhline(0, color="black", lw=0.6)
+    axL.grid(True, axis="y", alpha=0.3)
+    axL.legend(loc="lower right", fontsize=8, ncol=2)
+    # Territory annotations as shaded vertical bands
+    from matplotlib.patches import Rectangle
+    band = {"Inferior": "#C44E52", "Anterior": "#4C72B0", "Lateral": "#55A868"}
+    for terr, idxs in TERRITORIES.items():
+        for j in idxs:
+            axL.add_patch(Rectangle((j - 0.5, axL.get_ylim()[0]), 1.0,
+                                     axL.get_ylim()[1] - axL.get_ylim()[0],
+                                     facecolor=band[terr], alpha=0.06, zorder=-1))
+    fig.suptitle("Model comparison on validation set", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_baseline_vs_adapter(z_rest: np.ndarray, z_hat: np.ndarray,
@@ -520,6 +629,17 @@ def parse_args():
     ap.add_argument("--include-methods", type=str, nargs="+", default=None,
                     choices=["GReLU", "MLP"],
                     help="Limit box plot to these methods.")
+    ap.add_argument("--grelu-ckpt", type=str,
+                    default=str(CKPT_DIR / "grelu_best.pt"),
+                    help="Convex GReLU adapter (with prior) for model comparison.")
+    ap.add_argument("--grelu-zero-prior-ckpt", type=str,
+                    default=str(CKPT_DIR / "grelu_best_zero_prior.pt"),
+                    help="Convex GReLU adapter trained with --zero-prior.")
+    ap.add_argument("--mlp-ckpt", type=str,
+                    default=str(CKPT_DIR / "mlp_best.pt"),
+                    help="Best non-convex MLP from the sweep.")
+    ap.add_argument("--target-sens", type=float, default=0.80,
+                    help="Sensitivity at which to report precision in the comparison plot.")
     ap.add_argument("--out-dir", type=str, default=str(FIG_DIR))
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--max-train-samples", type=int, default=4000,
@@ -561,44 +681,115 @@ def main():
     u_tr, *_ = build_tensors(sub, device=device, zero_prior=zero_prior)
 
     # ---- figures ------------------------------------------------------------
-    print("\n[1/7] neuron importance ...")
+    print("\n[1/12] neuron importance ...")
     plot_neuron_importance(adapter, out_dir / "neuron_importance.png")
 
-    print("\n[2/7] gate activation rates ...")
+    print("\n[2/12] gate activation rates ...")
     plot_gate_activation_rates(adapter, u_tr, out_dir / "gate_activation_rates.png")
 
-    print("\n[3/7] pruning sweep ...")
+    print("\n[3/12] pruning sweep ...")
     plot_pruning_sweep(Path(args.sweep_csv), out_dir / "pruning_sweep.png")
 
-    print("\n[4/7] ischemia ROC ...")
+    print("\n[4/12] ischemia ROC ...")
     pred_st80 = decode_st80(head, z_hat_va)
     scores = ischemia_patient_score(pred_st80, val_split["bl_st80"])
     plot_ischemia_roc(scores, val_split["ischemia"], out_dir / "ischemia_roc.png")
 
-    print("\n[5/7] per-dimension recovery ...")
+    print("\n[5/12] per-dimension recovery ...")
     plot_per_dim_recovery(z_hat_va, z_true_va, out_dir / "per_dim_recovery.png")
 
-    print("\n[6/7] recovery by label ...")
+    print("\n[6/12] recovery by label ...")
     plot_recovery_by_label(z_hat_va, z_true_va, val_split["ischemia"].astype(int),
                            out_dir / "recovery_by_label.png")
 
-    print("\n[7/9] baseline vs adapter ...")
+    print("\n[7/12] baseline vs adapter ...")
     plot_baseline_vs_adapter(z_rest_va, z_hat_va, z_true_va,
                              out_dir / "baseline_vs_adapter.png")
 
-    print("\n[8/9] per-lead ST80 Pearson ...")
+    print("\n[8/12] per-lead ST80 Pearson ...")
     plot_st80_per_lead_pearson(z_hat_va, z_true_va, val_split["bl_st80"], head,
                                out_dir / "st80_per_lead_pearson.png")
 
-    print("\n[9/9] sweep box plot (GReLU vs MLP) ...")
+    print("\n[9/12] sweep box plot (combined, GReLU vs MLP) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot.png",
         min_runs=args.min_runs,
         include_configs=args.include_configs,
         include_methods=args.include_methods,
     )
+    print("\n[10/12] sweep box plot (GReLU only) ...")
+    plot_sweep_boxplot(
+        Path(args.sweep_jsonl), out_dir / "sweep_boxplot_grelu.png",
+        min_runs=args.min_runs, include_configs=args.include_configs,
+        include_methods=["GReLU"],
+    )
+    print("\n[11/12] sweep box plot (MLP only) ...")
+    plot_sweep_boxplot(
+        Path(args.sweep_jsonl), out_dir / "sweep_boxplot_mlp.png",
+        min_runs=args.min_runs, include_configs=args.include_configs,
+        include_methods=["MLP"],
+    )
+
+    print("\n[12/12] model comparison (GReLU / GReLU 0prior / MLP) ...")
+    preds = _collect_model_predictions(
+        args.grelu_ckpt, args.grelu_zero_prior_ckpt, args.mlp_ckpt,
+        val_split, device,
+    )
+    if preds:
+        plot_model_comparison(preds, z_true_va, val_split, head,
+                              out_dir / "model_comparison.png",
+                              target_sens=args.target_sens)
+    else:
+        print("  (no model checkpoints available -- skipping comparison)")
 
     print(f"\nAll figures written to {out_dir}/")
+
+
+def _collect_model_predictions(grelu_path: str, grelu_zp_path: str, mlp_path: str,
+                                val_split: dict, device) -> dict[str, np.ndarray]:
+    """Load whichever model checkpoints exist and return z_hat per model."""
+    preds: dict[str, np.ndarray] = {}
+
+    # Convex GReLU (with prior)
+    if Path(grelu_path).exists():
+        try:
+            meta = torch.load(grelu_path, map_location="cpu", weights_only=False)
+            zp = bool((meta.get("config") or {}).get("zero_prior", False))
+            m = load_adapter(grelu_path, device=device); m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=zp)
+            with torch.no_grad():
+                preds["Convex GReLU\n(with prior)"] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping GReLU: {e})")
+    else:
+        print(f"  (no GReLU ckpt at {grelu_path})")
+
+    # Convex GReLU (zero prior)
+    if Path(grelu_zp_path).exists():
+        try:
+            m = load_adapter(grelu_zp_path, device=device); m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=True)
+            with torch.no_grad():
+                preds["Convex GReLU\n(zero prior)"] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping GReLU zero-prior: {e})")
+    else:
+        print(f"  (no zero-prior GReLU ckpt at {grelu_zp_path})")
+
+    # Best non-convex MLP
+    if Path(mlp_path).exists():
+        try:
+            from nonconvex_MLP import load_mlp
+            m = load_mlp(mlp_path, device=device); m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=False)
+            with torch.no_grad():
+                preds["Non-convex MLP"] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping MLP: {e})")
+    else:
+        print(f"  (no MLP ckpt at {mlp_path})")
+
+    return preds
 
 
 if __name__ == "__main__":
