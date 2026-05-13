@@ -7,8 +7,10 @@ Single seed:
 With seed variance (3 seeds, std reported):
     python src/train.py --seeds 42 43 44
 
-Override hyperparameters:
-    python src/train.py --m 2048 --epochs 200 --lr 5e-4
+Override hyperparameters (R-FISTA: lr is the initial step size,
+lambda-l1 / lambda-l2 are the regularizers on linear1.weight):
+    python src/train.py --m 2048 --epochs 300 --lr 1e-3 \
+        --lambda-l2 1e-4 --lambda-l1 1e-5
 """
 from __future__ import annotations
 
@@ -43,7 +45,15 @@ def parse_args():
     ap.add_argument("--epochs", type=int, default=DEFAULT_CONFIG["epochs"])
     ap.add_argument("--lr", type=float, default=DEFAULT_CONFIG["lr"])
     ap.add_argument("--batch-size", type=int, default=DEFAULT_CONFIG["batch_size"])
-    ap.add_argument("--lambda-l2", type=float, default=DEFAULT_CONFIG["lambda_l2"])
+    ap.add_argument("--lambda-l2", type=float, default=DEFAULT_CONFIG["lambda_l2"],
+                    help="L2 weight decay on linear1 and proj weights.")
+    ap.add_argument("--lambda-l1", type=float, default=DEFAULT_CONFIG["lambda_l1"],
+                    help="L1 penalty on linear1.weight (R-FISTA soft-thresholding prox).")
+    ap.add_argument("--ckpt-metric", type=str, default=DEFAULT_CONFIG["ckpt_metric"],
+                    choices=["latent_mse", "auroc"],
+                    help="Metric used to decide which iterate to checkpoint. "
+                         "'latent_mse' = lowest val latent MSE wins (default); "
+                         "'auroc' = highest val ischemia AUROC wins.")
     ap.add_argument("--eval-every", type=int, default=DEFAULT_CONFIG["eval_every"])
     ap.add_argument("--seeds", type=int, nargs="*", default=[42],
                     help="One seed -> single run. Multiple -> seed variance.")
@@ -61,6 +71,8 @@ def cfg_from_args(args) -> dict:
         "lr": args.lr,
         "batch_size": args.batch_size,
         "lambda_l2": args.lambda_l2,
+        "lambda_l1": args.lambda_l1,
+        "ckpt_metric": args.ckpt_metric,
         "eval_every": args.eval_every,
         "device": args.device,
     }
@@ -94,8 +106,10 @@ def main():
             train_split, val_split, head=head, config=cfg, ckpt_path=args.ckpt,
         )
         print("\n--- Final ---")
+        print(f"  ckpt metric:          {history.ckpt_metric}")
         print(f"  best epoch:           {history.best_epoch}")
         print(f"  best val_latent_mse:  {history.best_val_latent_mse:.6f}")
+        print(f"  best val_auroc:       {history.best_val_auroc:.6f}")
         print(f"  final train_mse:      {history.train_mse[-1]:.6f}")
         if history.val_residual_mse:
             print(f"  final val_resid_mse:  {history.val_residual_mse[-1]:.6f}")
