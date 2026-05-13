@@ -33,6 +33,7 @@ import itertools
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -250,8 +251,10 @@ def main():
     print(f"  train: {len(train_split['ischemia'])}   val: {len(val_split['ischemia'])}")
 
     grid = list(itertools.product(args.sizes, args.lrs, args.wds, args.l1s))
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"  grid: {len(args.sizes)} sizes x {len(args.lrs)} lrs x "
-          f"{len(args.wds)} wds x {len(args.l1s)} l1s = {len(grid)} runs\n")
+          f"{len(args.wds)} wds x {len(args.l1s)} l1s = {len(grid)} runs")
+    print(f"  run_id: {run_id}\n")
 
     def is_better(cand: dict, cur_best: dict | None) -> bool:
         if cur_best is None:
@@ -276,6 +279,7 @@ def main():
                 "method": "MLP",
                 "config": cfg_name,
                 "label": f"MLP/{cfg_name}/lr={lr:g}/wd={wd:g}/l1={l1:g}",
+                "run_id": run_id,
                 "seed": int(args.seed),
                 "size": cfg_name,
                 "hidden_dims": list(cfg["hidden_dims"]),

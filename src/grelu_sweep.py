@@ -24,6 +24,7 @@ import itertools
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -85,8 +86,10 @@ def main():
     print(f"  train: {len(train_split['ischemia'])}   val: {len(val_split['ischemia'])}")
 
     grid = list(itertools.product(args.sizes, args.lrs, args.wds, args.l1s))
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"  grid: {len(args.sizes)} sizes x {len(args.lrs)} lrs x "
-          f"{len(args.wds)} wds x {len(args.l1s)} l1s = {len(grid)} runs\n")
+          f"{len(args.wds)} wds x {len(args.l1s)} l1s = {len(grid)} runs")
+    print(f"  run_id: {run_id}\n")
 
     rows = []
     with out_path.open("a") as f:
@@ -120,6 +123,7 @@ def main():
                 "method": "GReLU",
                 "config": f"m={m}",
                 "label": f"GReLU/m={m}/lr={lr:g}/wd={wd:g}/l1={l1:g}",
+                "run_id": run_id,
                 "seed": int(args.seed),
                 "m": int(m),
                 "lr": float(lr),

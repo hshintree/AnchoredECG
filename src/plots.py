@@ -369,19 +369,26 @@ def plot_st80_per_lead_pearson(z_hat: np.ndarray, z_true: np.ndarray,
           f"max = {rho_delta.max():.3f} ({LEAD_NAMES[rho_delta.argmax()]})")
 
 
-def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, min_runs: int = 5,
+def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, min_runs: int = 1,
                        include_configs: list[str] | None = None,
-                       include_methods: list[str] | None = None):
+                       include_methods: list[str] | None = None,
+                       latest_only: bool = True):
     """AUROC box plot of sweep results, grouped by (method, config).
 
     Reads JSONL records written by `nonconvex_MLP.py` and `grelu_sweep.py`,
     groups by `method` -> `config`, and shows the val AUROC distribution
     across the hyperparameter grid (one point per hyperparameter combo).
 
-    The JSONL is append-only, so old / legacy / partial sweeps can leave
-    stale records around. To suppress those, configs with fewer than
-    `min_runs` records are dropped. Pass explicit `include_configs` /
-    `include_methods` to override.
+    Each record carries a `run_id` (timestamp). With `latest_only=True`
+    (default) we keep, per method, only the records belonging to the most
+    recent run_id seen in the file -- so stale older sweeps don't pollute
+    the boxes. Records without a run_id are treated as a 'legacy' group
+    and only kept if no record in their method has a run_id.
+
+    The box labels show the actual trial count (n=X) so you can see at a
+    glance how many hyperparameter points the box summarises. Configs with
+    fewer than `min_runs` records are dropped; the default 1 means show
+    everything.
     """
     import matplotlib.pyplot as plt
     metric = "val_auroc"
@@ -405,7 +412,40 @@ def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, min_runs: int = 5,
         return
 
     grelu_order = ["m=128", "m=256", "m=512", "m=1024", "m=2048", "m=4096"]
-    mlp_order = ["tiny", "small", "medium", "wide", "deep"]
+    mlp_order = ["tiny", "small", "medium", "wide", "deep", "huge"]
+
+    # Optionally filter to the most recent sweep per method. Records produced
+    # before run_id was added carry no `run_id` key; if a method has *any*
+    # records with run_id, drop its run-id-less ones; otherwise treat the
+    # legacy group as a single bucket and keep it.
+    if latest_only:
+        latest_by_method: dict[str, str] = {}
+        for r in records:
+            rid = r.get("run_id")
+            if rid is None:
+                continue
+            m = r["method"]
+            if rid > latest_by_method.get(m, ""):
+                latest_by_method[m] = rid
+        n_in, kept, n_legacy = len(records), [], 0
+        for r in records:
+            m = r["method"]
+            if m in latest_by_method:
+                if r.get("run_id") == latest_by_method[m]:
+                    kept.append(r)
+            else:
+                kept.append(r); n_legacy += 1
+        records = kept
+        if latest_by_method:
+            ids = ", ".join(f"{k}->{v}" for k, v in sorted(latest_by_method.items()))
+            print(f"  filtered to latest run_id per method ({ids})  "
+                  f"kept {len(records)} / {n_in} records")
+        if n_legacy:
+            print(f"  ({n_legacy} legacy records kept for methods with no run_id)")
+        if not records:
+            print(f"  (no records left after --latest-only filtering; "
+                  f"re-run grelu_sweep.py / nonconvex_MLP.py)")
+            return
 
     grouped: dict[tuple[str, str], list[dict]] = {}
     for r in records:
@@ -449,22 +489,24 @@ def plot_sweep_boxplot(jsonl_path: Path, out_path: Path, min_runs: int = 5,
               f"explicit --include-configs)")
         return
 
-    labels = [f"{m}\n{c}" for m, c in keys]
     box_data = [[r[metric] for r in grouped[k]] for k in keys]
-    n_per = max(len(v) for v in box_data)
+    counts = [len(v) for v in box_data]
+    labels = [f"{m}\n{c}\nn={n}" for (m, c), n in zip(keys, counts)]
     colors = ["#4C72B0" if m == "GReLU" else "#DD8452" for m, _ in keys]
 
-    fig, ax = plt.subplots(1, 1, figsize=(max(7, len(keys) * 1.2), 5))
+    fig, ax = plt.subplots(1, 1, figsize=(max(7, len(keys) * 1.4), 5))
     bp = ax.boxplot(box_data, tick_labels=labels, patch_artist=True, widths=0.6)
     for patch, color in zip(bp["boxes"], colors):
         patch.set_facecolor(color); patch.set_alpha(0.75)
     for i, runs in enumerate(box_data, start=1):
         x = np.full(len(runs), i, dtype=float) + np.random.uniform(-0.08, 0.08, size=len(runs))
         ax.plot(x, runs, "o", color="black", markersize=4, alpha=0.7)
-    ax.set_title(f"Val AUROC  (n={n_per} hp-combos per config)")
+    total = sum(counts)
+    ax.set_title(f"Val AUROC across hyperparameter trials  "
+                 f"({total} total, n shown per config)")
     ax.set_ylabel("AUROC")
     ax.grid(True, axis="y", alpha=0.3)
-    ax.tick_params(axis="x", rotation=0)
+    ax.tick_params(axis="x", rotation=0, labelsize=9)
 
     from matplotlib.patches import Patch
     legend_handles = [
@@ -620,11 +662,16 @@ def parse_args():
     ap.add_argument("--sweep-csv", type=str, default=str(CKPT_DIR / "polish_sweep.csv"))
     ap.add_argument("--sweep-jsonl", type=str, default=str(CKPT_DIR / "sweep_results.jsonl"),
                     help="JSONL written by nonconvex_MLP.py and grelu_sweep.py")
-    ap.add_argument("--min-runs", type=int, default=5,
-                    help="Drop sweep configs with fewer than this many records "
-                         "(filters out legacy seed-variance runs).")
+    ap.add_argument("--min-runs", type=int, default=1,
+                    help="Drop sweep configs with fewer than this many records. "
+                         "Default 1 = show everything; raise it to hide tiny groups.")
+    ap.add_argument("--all-runs", action="store_true",
+                    help="By default the box plot keeps only records with the "
+                         "most recent run_id per method (so old / stale sweep "
+                         "runs in the same JSONL don't pollute the boxes). "
+                         "Pass this flag to keep everything.")
     ap.add_argument("--include-configs", type=str, nargs="+", default=None,
-                    help="Override --min-runs and show exactly these config names "
+                    help="Override filters and show exactly these config names "
                          "(e.g. m=256 m=1024 m=4096 tiny medium wide).")
     ap.add_argument("--include-methods", type=str, nargs="+", default=None,
                     choices=["GReLU", "MLP"],
@@ -710,24 +757,26 @@ def main():
     plot_st80_per_lead_pearson(z_hat_va, z_true_va, val_split["bl_st80"], head,
                                out_dir / "st80_per_lead_pearson.png")
 
+    latest_only = not args.all_runs
     print("\n[9/12] sweep box plot (combined, GReLU vs MLP) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot.png",
         min_runs=args.min_runs,
         include_configs=args.include_configs,
         include_methods=args.include_methods,
+        latest_only=latest_only,
     )
     print("\n[10/12] sweep box plot (GReLU only) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot_grelu.png",
         min_runs=args.min_runs, include_configs=args.include_configs,
-        include_methods=["GReLU"],
+        include_methods=["GReLU"], latest_only=latest_only,
     )
     print("\n[11/12] sweep box plot (MLP only) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot_mlp.png",
         min_runs=args.min_runs, include_configs=args.include_configs,
-        include_methods=["MLP"],
+        include_methods=["MLP"], latest_only=latest_only,
     )
 
     print("\n[12/12] model comparison (GReLU / GReLU 0prior / MLP) ...")
