@@ -33,6 +33,7 @@ import itertools
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -94,12 +95,13 @@ SIZE_CONFIGS: dict[str, dict] = {
     "tiny":   {"hidden_dims": (64,),    "dropout": 0.0},
     "medium": {"hidden_dims": (256,),   "dropout": 0.0},
     "wide":   {"hidden_dims": (1024,),  "dropout": 0.0},
+    "huge":   {"hidden_dims": (2048,),  "dropout": 0.0},
 }
 
-DEFAULT_SIZES = ["tiny", "medium", "wide"]
+DEFAULT_SIZES = ["tiny", "medium", "wide", "huge"]
 DEFAULT_LRS = [1e-4, 1e-3, 1e-2]
-DEFAULT_WDS = [0.0, 1e-4]
-DEFAULT_L1S = [0.0, 1e-5, 1e-4]
+DEFAULT_WDS = [0.0]
+DEFAULT_L1S = [0.0]
 
 
 def count_trainable(model: nn.Module) -> int:
@@ -109,6 +111,39 @@ def count_trainable(model: nn.Module) -> int:
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+def save_mlp(model: "MLPResidualAdapter", path: str | Path,
+             hidden_dims, dropout: float,
+             d_input: int, d_output: int,
+             config: dict | None = None,
+             metrics: dict | None = None) -> None:
+    """Persist an MLP model with enough metadata to rebuild it from scratch."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "state_dict":  model.state_dict(),
+        "hidden_dims": list(hidden_dims),
+        "dropout":     float(dropout),
+        "d_input":     int(d_input),
+        "d_output":    int(d_output),
+        "config":      config,
+        "metrics":     metrics,
+    }, path)
+
+
+def load_mlp(path: str | Path, device: torch.device | None = None
+             ) -> "MLPResidualAdapter":
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model = MLPResidualAdapter(
+        d_input=int(ckpt["d_input"]), d_output=int(ckpt["d_output"]),
+        hidden_dims=ckpt["hidden_dims"], dropout=float(ckpt["dropout"]),
+    )
+    model.load_state_dict(ckpt["state_dict"])
+    if device is not None:
+        model = model.to(device)
+    model.eval()
+    return model
+
 
 def train_mlp(
     train_split: dict,
@@ -124,8 +159,8 @@ def train_mlp(
     seed: int = 42,
     device: torch.device | None = None,
     verbose: bool = False,
-) -> dict:
-    """Train one MLP configuration. Returns a metrics dict."""
+) -> tuple["MLPResidualAdapter", dict]:
+    """Train one MLP configuration. Returns (trained_model, metrics_dict)."""
     device = device or pick_device(None)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -166,7 +201,7 @@ def train_mlp(
         model, u_va, r_va, zr_va, zs_va,
         head=head, y=val_split["ischemia"], bl_st80=val_split["bl_st80"],
     )
-    return {
+    return model, {
         "val_residual_mse": metrics["residual_mse"],
         "val_latent_mse": metrics["latent_mse"],
         "val_auroc": metrics.get("auroc", float("nan")),
@@ -191,7 +226,13 @@ def parse_args():
     ap.add_argument("--l1s", type=float, nargs="+", default=DEFAULT_L1S)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--out", type=str, default=str(CKPT_DIR / "sweep_results.jsonl"))
+    ap.add_argument("--out", type=str, default=str(CKPT_DIR / "sweep_results.jsonl"),
+                    help="JSONL append path for sweep records.")
+    ap.add_argument("--ckpt", type=str, default=str(CKPT_DIR / "mlp_best.pt"),
+                    help="Path to save the best MLP found during the sweep.")
+    ap.add_argument("--ckpt-metric", type=str, default="auroc",
+                    choices=["auroc", "latent_mse"],
+                    help="Metric used to decide which run is 'best' and gets saved.")
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--verbose", action="store_true")
     return ap.parse_args()
@@ -210,14 +251,24 @@ def main():
     print(f"  train: {len(train_split['ischemia'])}   val: {len(val_split['ischemia'])}")
 
     grid = list(itertools.product(args.sizes, args.lrs, args.wds, args.l1s))
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"  grid: {len(args.sizes)} sizes x {len(args.lrs)} lrs x "
-          f"{len(args.wds)} wds x {len(args.l1s)} l1s = {len(grid)} runs\n")
+          f"{len(args.wds)} wds x {len(args.l1s)} l1s = {len(grid)} runs")
+    print(f"  run_id: {run_id}\n")
 
+    def is_better(cand: dict, cur_best: dict | None) -> bool:
+        if cur_best is None:
+            return True
+        if args.ckpt_metric == "auroc":
+            return float(cand["val_auroc"]) > float(cur_best["val_auroc"])
+        return float(cand["val_latent_mse"]) < float(cur_best["val_latent_mse"])
+
+    best_rec: dict | None = None
     rows = []
     with out_path.open("a") as f:
         for i, (cfg_name, lr, wd, l1) in enumerate(grid, 1):
             cfg = SIZE_CONFIGS[cfg_name]
-            metrics = train_mlp(
+            model, metrics = train_mlp(
                 train_split, val_split, head,
                 hidden_dims=cfg["hidden_dims"], dropout=cfg["dropout"],
                 epochs=args.epochs, batch_size=args.batch_size,
@@ -228,6 +279,7 @@ def main():
                 "method": "MLP",
                 "config": cfg_name,
                 "label": f"MLP/{cfg_name}/lr={lr:g}/wd={wd:g}/l1={l1:g}",
+                "run_id": run_id,
                 "seed": int(args.seed),
                 "size": cfg_name,
                 "hidden_dims": list(cfg["hidden_dims"]),
@@ -240,11 +292,27 @@ def main():
             }
             f.write(json.dumps(rec) + "\n"); f.flush()
             rows.append(rec)
+            marker = ""
+            if is_better(rec, best_rec):
+                best_rec = rec
+                save_mlp(
+                    model, args.ckpt,
+                    hidden_dims=cfg["hidden_dims"], dropout=cfg["dropout"],
+                    d_input=384, d_output=192,
+                    config={
+                        "size": cfg_name, "lr": float(lr),
+                        "lambda_l2": float(wd), "lambda_l1": float(l1),
+                        "epochs": args.epochs, "seed": int(args.seed),
+                        "ckpt_metric": args.ckpt_metric,
+                    },
+                    metrics=metrics,
+                )
+                marker = "  <- new best, saved"
             print(f"[{i:2d}/{len(grid)}] MLP {cfg_name:<6s} lr={lr:g} wd={wd:g} l1={l1:g}  "
                   f"params={rec['n_params']:>7d}  "
                   f"val_latent_mse={rec['val_latent_mse']:.4f}  "
                   f"val_auroc={rec['val_auroc']:.4f}  "
-                  f"({rec['train_time_s']:.1f}s)")
+                  f"({rec['train_time_s']:.1f}s){marker}")
 
     # Summary grouped by size
     print("\n--- MLP sweep summary (across hyperparams, per size) ---")
@@ -266,6 +334,14 @@ def main():
               f"l1={best['lambda_l1']:g} -> latent_mse={best['val_latent_mse']:.4f} "
               f"auroc={best['val_auroc']:.4f}")
     print(f"\nAppended {len(rows)} records to {out_path}")
+    if best_rec is not None:
+        print(f"\nBest MLP (by {args.ckpt_metric}) saved to {args.ckpt}")
+        print(f"  size={best_rec['config']:<6s}  lr={best_rec['lr']:g}  "
+              f"wd={best_rec['lambda_l2']:g}  l1={best_rec['lambda_l1']:g}  "
+              f"epochs={best_rec['epochs']}")
+        print(f"  val_auroc={best_rec['val_auroc']:.4f}  "
+              f"val_latent_mse={best_rec['val_latent_mse']:.4f}  "
+              f"params={best_rec['n_params']}")
 
 
 if __name__ == "__main__":
