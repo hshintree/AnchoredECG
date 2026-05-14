@@ -25,6 +25,12 @@ Figures produced (all written to --out-dir, default: figures/):
                                    split by ischemia status.
   7.  baseline_vs_adapter.png      Latent MSE: rest-only vs adapter, paired
                                    per-patient scatter.
+  8.  sweep / model-comparison figures (JSONL checkpoints, ROC extensions, ...)
+  ... st80_per_lead_pearson.png, sweep_boxplot*.png, model_comparison.png ...
+
+  Additional outputs when adapter checkpoints exist (see CLI paths):
+  •  ischemia_roc_methods.png       Multi-method ischemia ROC overlay
+  •  st80_per_lead_pearson_methods.png (+ .csv)   Per-lead dST80 Pearson — all checkpoints
 
 Usage:
     python src/plots.py --ckpt checkpoints/grelu_best.pt
@@ -239,6 +245,120 @@ def plot_ischemia_roc(scores: np.ndarray, labels: np.ndarray, out_path: Path):
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  AUROC = {auc_pt:.4f}  95% CI [{lo:.4f}, {hi:.4f}]")
+
+
+def plot_multi_method_ischemia_roc_overlay(
+    scores_by_model: dict[str, np.ndarray],
+    labels: np.ndarray,
+    out_path: Path,
+    *,
+    title: str = "Ischemia ROC — all available checkpoints (val)",
+) -> None:
+    """One figure, one ROC curve per model (frozen ST80 head + patient scores)."""
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_curve, roc_auc_score
+
+    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
+               "#937860", "#DA8BC3", "#8C8C8C", "#E17C05", "#76B7B2"]
+
+    labels = np.asarray(labels)
+    fig, ax = plt.subplots(figsize=(7.0, 6.2))
+
+    print(f"  overlaying ROC for {len(scores_by_model)} models ...")
+    for i, (name, scores) in enumerate(scores_by_model.items()):
+        color = palette[i % len(palette)]
+        if len(np.unique(labels)) < 2:
+            auc = float("nan")
+            fpr = np.array([0.0, 1.0])
+            tpr = np.array([0.0, 1.0])
+        else:
+            auc = float(roc_auc_score(labels, scores))
+            fpr, tpr, _ = roc_curve(labels, scores)
+        ax.plot(fpr, tpr, lw=2.0, color=color,
+                label=f"{name.replace(chr(10), ' ')} (AUC={auc:.3f})")
+
+    ax.plot([0, 1], [0, 1], "--", color="gray", lw=1.0, label="chance")
+    ax.set(xlabel="False positive rate", ylabel="True positive rate", title=title)
+    ax.legend(loc="lower right", fontsize=7.8, framealpha=0.92)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+def plot_multi_method_per_lead_pearson_panel(
+    preds: dict[str, np.ndarray],
+    z_true: np.ndarray,
+    bl_st80: np.ndarray,
+    head,
+    out_path: Path,
+    csv_path: Path | None = None,
+) -> None:
+    """Grouped bar chart: every model × 12 leads, delta-ST80 Pearson r (val).
+
+    Matches the interpretation used in plot_model_comparison; also writes an
+    optional CSV (`method × lead`).
+    """
+    import csv
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch, Rectangle
+
+    from adapter_interface import TERRITORIES
+
+    names = list(preds.keys())
+    mat = np.stack([per_lead_delta_pearson(preds[k], z_true, bl_st80, head) for k in names])
+    n_models, n_leads = mat.shape
+    assert n_leads == len(LEAD_NAMES)
+
+    fig, ax = plt.subplots(figsize=(16, 5.2))
+    x = np.arange(n_leads)
+    width = 0.8 / max(n_models, 1)
+    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2",
+               "#937860", "#DA8BC3", "#8C8C8C", "#E17C05", "#76B7B2"]
+
+    for i, name in enumerate(names):
+        xpos = x + (i - (n_models - 1) / 2) * width
+        rho = mat[i]
+        label = f"{name.replace(chr(10), ' ')}  (mean r = {rho.mean():.3f})"
+        ax.bar(xpos, rho, width=width, color=palette[i % len(palette)],
+               edgecolor="black", linewidth=0.35, label=label)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(LEAD_NAMES)
+    ax.set_ylabel("Pearson r")
+    ax.set_ylim(-0.15, 1.05)
+    ax.axhline(0.0, color="black", lw=0.6)
+    ax.set_title("Per-lead Pearson r (val): predicted dST80 vs true dST80 — all checkpoints")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.42), ncol=2, fontsize=7.5)
+
+    band = {"Inferior": "#C44E52", "Anterior": "#4C72B0", "Lateral": "#55A868"}
+    for terr, idxs in TERRITORIES.items():
+        for j in idxs:
+            ax.add_patch(Rectangle(
+                (j - 0.5, ax.get_ylim()[0]), 1.0, ax.get_ylim()[1] - ax.get_ylim()[0],
+                facecolor=band[terr], alpha=0.06, zorder=-1,
+            ))
+
+    territory_handles = [Patch(facecolor=c, label=n) for n, c in band.items()]
+    fig.legend(handles=territory_handles, loc="upper center", ncol=3,
+               bbox_to_anchor=(0.5, 1.02), fontsize=8)
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.28)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+    if csv_path is not None:
+        with csv_path.open("w", newline="") as cf:
+            w = csv.writer(cf)
+            w.writerow(["method", *LEAD_NAMES, "mean_r"])
+            for name, row in zip(names, mat):
+                w.writerow([name.replace("\n", " ")] + [f"{v:.5f}" for v in row]
+                           + [f"{row.mean():.5f}"])
+        print(f"  wrote {csv_path}")
 
 
 def plot_per_dim_recovery(z_hat: np.ndarray, z_true: np.ndarray, out_path: Path):
@@ -674,8 +794,8 @@ def parse_args():
                     help="Override filters and show exactly these config names "
                          "(e.g. m=256 m=1024 m=4096 tiny medium wide).")
     ap.add_argument("--include-methods", type=str, nargs="+", default=None,
-                    choices=["GReLU", "MLP"],
-                    help="Limit box plot to these methods.")
+                    help="Limit sweep box plots to methods named in JSONL "
+                         "(e.g. GReLU MLP ElasticNet KernelRidge LoRA AttentionLinear).")
     ap.add_argument("--grelu-ckpt", type=str,
                     default=str(CKPT_DIR / "grelu_best.pt"),
                     help="Convex GReLU adapter (with prior) for model comparison.")
@@ -685,6 +805,18 @@ def parse_args():
     ap.add_argument("--mlp-ckpt", type=str,
                     default=str(CKPT_DIR / "mlp_best.pt"),
                     help="Best non-convex MLP from the sweep.")
+    ap.add_argument("--linear-ckpt", type=str,
+                    default=str(CKPT_DIR / "linear_best.pt"),
+                    help="ElasticNet / linear sweep best (joblib).")
+    ap.add_argument("--kernel-ckpt", type=str,
+                    default=str(CKPT_DIR / "kernel_best.pt"),
+                    help="Kernel ridge best (joblib).")
+    ap.add_argument("--lora-ckpt", type=str,
+                    default=str(CKPT_DIR / "lora_best.pt"),
+                    help="LoRA best (torch).")
+    ap.add_argument("--attention-ckpt", type=str,
+                    default=str(CKPT_DIR / "attention_best.pt"),
+                    help="Attention adapter best (torch).")
     ap.add_argument("--target-sens", type=float, default=0.80,
                     help="Sensitivity at which to report precision in the comparison plot.")
     ap.add_argument("--out-dir", type=str, default=str(FIG_DIR))
@@ -728,37 +860,37 @@ def main():
     u_tr, *_ = build_tensors(sub, device=device, zero_prior=zero_prior)
 
     # ---- figures ------------------------------------------------------------
-    print("\n[1/12] neuron importance ...")
+    print("\n[1/14] neuron importance ...")
     plot_neuron_importance(adapter, out_dir / "neuron_importance.png")
 
-    print("\n[2/12] gate activation rates ...")
+    print("\n[2/14] gate activation rates ...")
     plot_gate_activation_rates(adapter, u_tr, out_dir / "gate_activation_rates.png")
 
-    print("\n[3/12] pruning sweep ...")
+    print("\n[3/14] pruning sweep ...")
     plot_pruning_sweep(Path(args.sweep_csv), out_dir / "pruning_sweep.png")
 
-    print("\n[4/12] ischemia ROC ...")
+    print("\n[4/14] ischemia ROC ...")
     pred_st80 = decode_st80(head, z_hat_va)
     scores = ischemia_patient_score(pred_st80, val_split["bl_st80"])
     plot_ischemia_roc(scores, val_split["ischemia"], out_dir / "ischemia_roc.png")
 
-    print("\n[5/12] per-dimension recovery ...")
+    print("\n[5/14] per-dimension recovery ...")
     plot_per_dim_recovery(z_hat_va, z_true_va, out_dir / "per_dim_recovery.png")
 
-    print("\n[6/12] recovery by label ...")
+    print("\n[6/14] recovery by label ...")
     plot_recovery_by_label(z_hat_va, z_true_va, val_split["ischemia"].astype(int),
                            out_dir / "recovery_by_label.png")
 
-    print("\n[7/12] baseline vs adapter ...")
+    print("\n[7/14] baseline vs adapter ...")
     plot_baseline_vs_adapter(z_rest_va, z_hat_va, z_true_va,
                              out_dir / "baseline_vs_adapter.png")
 
-    print("\n[8/12] per-lead ST80 Pearson ...")
+    print("\n[8/14] per-lead ST80 Pearson ...")
     plot_st80_per_lead_pearson(z_hat_va, z_true_va, val_split["bl_st80"], head,
                                out_dir / "st80_per_lead_pearson.png")
 
     latest_only = not args.all_runs
-    print("\n[9/12] sweep box plot (combined, GReLU vs MLP) ...")
+    print("\n[9/14] sweep box plot (combined, GReLU vs MLP) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot.png",
         min_runs=args.min_runs,
@@ -766,78 +898,181 @@ def main():
         include_methods=args.include_methods,
         latest_only=latest_only,
     )
-    print("\n[10/12] sweep box plot (GReLU only) ...")
+    print("\n[10/14] sweep box plot (GReLU only) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot_grelu.png",
         min_runs=args.min_runs, include_configs=args.include_configs,
         include_methods=["GReLU"], latest_only=latest_only,
     )
-    print("\n[11/12] sweep box plot (MLP only) ...")
+    print("\n[11/14] sweep box plot (MLP only) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot_mlp.png",
         min_runs=args.min_runs, include_configs=args.include_configs,
         include_methods=["MLP"], latest_only=latest_only,
     )
 
-    print("\n[12/12] model comparison (GReLU / GReLU 0prior / MLP) ...")
-    preds = _collect_model_predictions(
-        args.grelu_ckpt, args.grelu_zero_prior_ckpt, args.mlp_ckpt,
-        val_split, device,
-    )
-    if preds:
-        plot_model_comparison(preds, z_true_va, val_split, head,
+    all_preds = _collect_model_predictions(val_split, device, args)
+
+    print("\n[12/14] model comparison (GReLU / GReLU 0prior / MLP) ...")
+    cmp_keys = [
+        "Convex GReLU\n(with prior)",
+        "Convex GReLU\n(zero prior)",
+        "Non-convex MLP",
+    ]
+    cmp_preds = {k: all_preds[k] for k in cmp_keys if k in all_preds}
+    if cmp_preds:
+        plot_model_comparison(cmp_preds, z_true_va, val_split, head,
                               out_dir / "model_comparison.png",
                               target_sens=args.target_sens)
     else:
-        print("  (no model checkpoints available -- skipping comparison)")
+        print("  (no GReLU/MLP triplet checkpoints -- skipping compact comparison)")
+
+    print("\n[13/14] multi-method ischemia ROC overlay ...")
+    if len(all_preds) >= 1:
+        scores_by_model = {}
+        for name, z_hat in all_preds.items():
+            pred_st = decode_st80(head, z_hat)
+            scores_by_model[name] = ischemia_patient_score(pred_st, val_split["bl_st80"])
+        plot_multi_method_ischemia_roc_overlay(
+            scores_by_model, val_split["ischemia"], out_dir / "ischemia_roc_methods.png",
+        )
+    else:
+        print("  (no checkpoints found for multi-method ROC)")
+
+    print("\n[14/14] multi-method per-lead Pearson (dST80) ...")
+    if len(all_preds) >= 1:
+        plot_multi_method_per_lead_pearson_panel(
+            all_preds, z_true_va, val_split["bl_st80"], head,
+            out_dir / "st80_per_lead_pearson_methods.png",
+            csv_path=out_dir / "st80_per_lead_pearson_methods.csv",
+        )
+    else:
+        print("  (no checkpoints -- skipping per-lead Pearson panel)")
 
     print(f"\nAll figures written to {out_dir}/")
 
 
-def _collect_model_predictions(grelu_path: str, grelu_zp_path: str, mlp_path: str,
-                                val_split: dict, device) -> dict[str, np.ndarray]:
-    """Load whichever model checkpoints exist and return z_hat per model."""
+def _collect_model_predictions(val_split: dict, device,
+                               args: argparse.Namespace,
+                               ) -> dict[str, np.ndarray]:
+    """Load every adapter checkpoint named on the CLI; return z_hat (val) per model."""
+
     preds: dict[str, np.ndarray] = {}
 
-    # Convex GReLU (with prior)
-    if Path(grelu_path).exists():
+    # ---- Convex GReLU (with prior) -----------------------------------------
+    gp = Path(args.grelu_ckpt)
+    if gp.exists():
         try:
-            meta = torch.load(grelu_path, map_location="cpu", weights_only=False)
+            meta = torch.load(gp, map_location="cpu", weights_only=False)
             zp = bool((meta.get("config") or {}).get("zero_prior", False))
-            m = load_adapter(grelu_path, device=device); m.eval()
+            m = load_adapter(gp, device=device)
+            m.eval()
             uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=zp)
             with torch.no_grad():
                 preds["Convex GReLU\n(with prior)"] = (zr + m(uv)).cpu().numpy()
         except Exception as e:
             print(f"  (skipping GReLU: {e})")
     else:
-        print(f"  (no GReLU ckpt at {grelu_path})")
+        print(f"  (no GReLU ckpt at {gp})")
 
-    # Convex GReLU (zero prior)
-    if Path(grelu_zp_path).exists():
+    # ---- Convex GReLU (zero prior) ----------------------------------------
+    gz = Path(args.grelu_zero_prior_ckpt)
+    if gz.exists():
         try:
-            m = load_adapter(grelu_zp_path, device=device); m.eval()
+            m = load_adapter(gz, device=device)
+            m.eval()
             uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=True)
             with torch.no_grad():
                 preds["Convex GReLU\n(zero prior)"] = (zr + m(uv)).cpu().numpy()
         except Exception as e:
             print(f"  (skipping GReLU zero-prior: {e})")
     else:
-        print(f"  (no zero-prior GReLU ckpt at {grelu_zp_path})")
+        print(f"  (no zero-prior GReLU ckpt at {gz})")
 
-    # Best non-convex MLP
-    if Path(mlp_path).exists():
+    # ---- Non-convex MLP -----------------------------------------------------
+    mp = Path(args.mlp_ckpt)
+    if mp.exists():
         try:
             from nonconvex_MLP import load_mlp
-            m = load_mlp(mlp_path, device=device); m.eval()
+            m = load_mlp(mp, device=device)
+            m.eval()
             uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=False)
             with torch.no_grad():
                 preds["Non-convex MLP"] = (zr + m(uv)).cpu().numpy()
         except Exception as e:
             print(f"  (skipping MLP: {e})")
     else:
-        print(f"  (no MLP ckpt at {mlp_path})")
+        print(f"  (no MLP ckpt at {mp})")
 
+    # ---- ElasticNet (sklearn joblib) --------------------------------------
+    lp = Path(args.linear_ckpt)
+    if lp.exists():
+        try:
+            from linear_adapter import load_linear
+            m = load_linear(lp).to(device)
+            m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=False)
+            with torch.no_grad():
+                preds["ElasticNet (linear)"] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping linear/ElasticNet ckpt: {e})")
+    else:
+        print(f"  (no linear ckpt at {lp})")
+
+    # ---- Kernel ridge --------------------------------------------------------
+    kp = Path(args.kernel_ckpt)
+    if kp.exists():
+        try:
+            from kernel_adapter import load_kernel
+            m = load_kernel(kp).to(device)
+            m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=False)
+            with torch.no_grad():
+                preds["Kernel ridge"] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping kernel ckpt: {e})")
+    else:
+        print(f"  (no kernel ckpt at {kp})")
+
+    # ---- LoRA --------------------------------------------------------------
+    lop = Path(args.lora_ckpt)
+    if lop.exists():
+        try:
+            from lora_adapter import load_lora
+            m = load_lora(lop, device=device)
+            m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=False)
+            with torch.no_grad():
+                preds["LoRA"] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping LoRA ckpt: {e})")
+    else:
+        print(f"  (no LoRA ckpt at {lop})")
+
+    # ---- Attention ----------------------------------------------------------
+    attn_p = Path(args.attention_ckpt)
+    if attn_p.exists():
+        try:
+            from attention_adapter import load_attention
+            meta = torch.load(attn_p, map_location="cpu", weights_only=False)
+            variant = meta.get("variant")
+            if variant is None and isinstance(meta.get("config"), dict):
+                variant = meta["config"].get("variant")
+            if variant == "attn_additive":
+                alabel = "Attention (additive)"
+            else:
+                alabel = "Attention (linear)"
+            m = load_attention(attn_p, device=device)
+            m.eval()
+            uv, _, zr, _ = build_tensors(val_split, device=device, zero_prior=False)
+            with torch.no_grad():
+                preds[alabel] = (zr + m(uv)).cpu().numpy()
+        except Exception as e:
+            print(f"  (skipping attention ckpt: {e})")
+    else:
+        print(f"  (no attention ckpt at {attn_p})")
+
+    print(f"  Loaded {len(preds)} model(s) with valid checkpoints for aggregation plots.")
     return preds
 
 

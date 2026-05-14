@@ -25,13 +25,13 @@ method = "ElasticNet" | "prior_only" | "single_lead_only".
 
 Usage:
     python src/linear_adapter.py
-    python src/linear_adapter.py --epochs 5000          # max_iter for sklearn
+    python src/linear_adapter.py --epochs 2000 --elastic-tol 5e-4
     python src/linear_adapter.py --l1-ratios 0 0.5 1
 """
 from __future__ import annotations
 
 import argparse
-import itertools
+import copy
 import json
 import sys
 import time
@@ -93,8 +93,16 @@ class LinearResidualAdapter(nn.Module):
 
     def fit(self, u_tr: np.ndarray, r_tr: np.ndarray,
             alpha: float = 1e-3, l1_ratio: float = 0.5,
-            max_iter: int = 5000, tol: float = 1e-4) -> None:
-        """Fit on numpy arrays. No-op for the prior_only ablation."""
+            max_iter: int = 1200, tol: float = 1e-3,
+            random_state: int | None = None, selection: str = "random") -> None:
+        """Fit on numpy arrays. No-op for the prior_only ablation.
+
+        MultiTaskElasticNet / MultiTaskLasso use coordinate descent, which can
+        appear to "hang" on ~4k × 384 problems if `max_iter` is huge and `tol`
+        is very tight. Defaults are chosen to finish in tens of seconds typical
+        laptops; increase `--epochs` / tighten `--elastic-tol` if you need higher
+        numerical accuracy.
+        """
         if self.ablation == "prior_only":
             self.sklearn_model = None
             return
@@ -109,12 +117,16 @@ class LinearResidualAdapter(nn.Module):
             from sklearn.linear_model import MultiTaskLasso
             self.sklearn_model = MultiTaskLasso(
                 alpha=float(alpha), max_iter=int(max_iter), tol=float(tol),
+                selection=selection,
+                random_state=random_state,
             )
         else:
             from sklearn.linear_model import MultiTaskElasticNet
             self.sklearn_model = MultiTaskElasticNet(
                 alpha=float(alpha), l1_ratio=float(l1_ratio),
                 max_iter=int(max_iter), tol=float(tol),
+                selection=selection,
+                random_state=random_state,
             )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # silence ConvergenceWarning at high lambda
@@ -195,11 +207,18 @@ def _eval_on_val(adapter: LinearResidualAdapter, u_va, r_va, zr_va, zs_va,
 def fit_one(u_tr_np: np.ndarray, r_tr_np: np.ndarray,
             u_va, r_va, zr_va, zs_va, head, val_split, device,
             alpha: float, l1_ratio: float, max_iter: int,
-            ablation: str = "none") -> tuple[LinearResidualAdapter, dict, float]:
+            ablation: str = "none",
+            elastic_tol: float = 1e-3,
+            random_state: int | None = None,
+            selection: str = "random",
+            progress: str | None = None) -> tuple[LinearResidualAdapter, dict, float]:
     """Fit a single LinearResidualAdapter and return (adapter, metrics, train_time)."""
     adapter = LinearResidualAdapter(ablation=ablation)
+    if progress:
+        print(progress, flush=True)
     t0 = time.time()
-    adapter.fit(u_tr_np, r_tr_np, alpha=alpha, l1_ratio=l1_ratio, max_iter=max_iter)
+    adapter.fit(u_tr_np, r_tr_np, alpha=alpha, l1_ratio=l1_ratio, max_iter=max_iter,
+                tol=elastic_tol, random_state=random_state, selection=selection)
     train_time = time.time() - t0
     m = _eval_on_val(adapter, u_va, r_va, zr_va, zs_va, head, val_split, device)
     metrics = {
@@ -226,8 +245,12 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--l1-ratios", type=float, nargs="+", default=DEFAULT_L1_RATIOS)
     ap.add_argument("--alphas", type=float, nargs="+", default=DEFAULT_ALPHAS)
-    ap.add_argument("--epochs", type=int, default=5000,
-                    help="max_iter passed to the iterative ElasticNet/Lasso solvers.")
+    ap.add_argument("--epochs", type=int, default=1200,
+                    help="max_iter for MultiTaskElasticNet / MultiTaskLasso. "
+                         "Very large values slow each fit a lot on this dataset size.")
+    ap.add_argument("--elastic-tol", type=float, default=1e-3,
+                    help="Stopping tolerance for coordinate descent (ElasticNet/Lasso). "
+                         "Smaller = more accurate but much slower.")
     ap.add_argument("--batch-size", type=int, default=256,
                     help="Unused (closed-form solver); accepted for CLI symmetry.")
     ap.add_argument("--out", type=str, default=str(CKPT_DIR / "sweep_results.jsonl"))
@@ -255,10 +278,10 @@ def main():
     )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    grid = list(itertools.product(args.l1_ratios, args.alphas))
-    n_total = len(grid) + 2  # +2 ablations
-    print(f"  grid: {len(args.l1_ratios)} l1_ratios x {len(args.alphas)} alphas "
-          f"= {len(grid)} ENet fits + 2 ablations  =  {n_total} runs")
+    n_grid_fits = len(args.l1_ratios) * len(args.alphas)
+    n_total = n_grid_fits + 2  # +2 ablations
+    print(f"  grid: {len(args.l1_ratios)} l1_ratios × {len(args.alphas)} alphas = {n_grid_fits} fits "
+          f"(ElasticNet/Lasso reuse warm_start across alphas per l1_ratio) + 2 ablations = {n_total} runs")
     print(f"  run_id: {run_id}\n")
 
     def is_better(cand: dict, cur: dict | None) -> bool:
@@ -303,19 +326,108 @@ def main():
                   f"({metrics['train_time_s']:.2f}s){marker}")
 
         idx = 0
-        # Main ElasticNet grid
-        for l1_ratio, alpha in grid:
-            idx += 1
-            adapter, metrics, _ = fit_one(
-                u_tr_np, r_tr_np, u_va, r_va, zr_va, zs_va, head, val_split, device,
-                alpha=alpha, l1_ratio=l1_ratio, max_iter=args.epochs, ablation="none",
+        selection = "random"
+        rs = int(args.seed)
+
+        for l1_ratio in args.l1_ratios:
+            if l1_ratio <= 1e-9:
+                for alpha in args.alphas:
+                    idx += 1
+                    prog = None
+                    if args.verbose:
+                        prog = (f"    [linear] Ridge  alpha={alpha:g}  "
+                                f"(solve via Cholesky — fast) ...")
+                    adapter, metrics, _ = fit_one(
+                        u_tr_np, r_tr_np, u_va, r_va, zr_va, zs_va, head, val_split, device,
+                        alpha=alpha, l1_ratio=l1_ratio, max_iter=args.epochs, ablation="none",
+                        elastic_tol=args.elastic_tol, random_state=rs,
+                        selection=selection, progress=prog,
+                    )
+                    cfg_name = f"alpha={alpha:g}/l1={l1_ratio:g}"
+                    _record("ElasticNet", cfg_name, f"ElasticNet/{cfg_name}",
+                            {"alpha": float(alpha), "l1_ratio": float(l1_ratio),
+                             "max_iter": int(args.epochs), "elastic_tol": float(args.elastic_tol),
+                             "warm_path": False},
+                            adapter, metrics, idx)
+                continue
+
+            if l1_ratio >= 1.0 - 1e-9:
+                from sklearn.linear_model import MultiTaskLasso
+                u_fit = np.asarray(u_tr_np, dtype=np.float64)
+                r_fit = np.asarray(r_tr_np, dtype=np.float64)
+                lasso = MultiTaskLasso(
+                    warm_start=True, max_iter=int(args.epochs), tol=float(args.elastic_tol),
+                    selection=selection, random_state=rs,
+                )
+                for alpha in sorted(args.alphas, reverse=True):
+                    idx += 1
+                    msg = (f"    [linear] MultiTaskLasso  alpha={alpha:g}  "
+                           f"(coordinate descent, warm_start) ...")
+                    print(msg, flush=True)
+                    t0 = time.time()
+                    lasso.set_params(alpha=float(alpha))
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        lasso.fit(u_fit, r_fit)
+                    train_time = time.time() - t0
+                    adapter = LinearResidualAdapter(ablation="none")
+                    adapter.sklearn_model = copy.deepcopy(lasso)
+                    m = _eval_on_val(adapter, u_va, r_va, zr_va, zs_va, head, val_split, device)
+                    metrics = {
+                        "val_residual_mse": m["residual_mse"],
+                        "val_latent_mse": m["latent_mse"],
+                        "val_auroc": m.get("auroc", float("nan")),
+                        "train_mse": float("nan"),
+                        "n_params": adapter.n_params,
+                        "train_time_s": train_time,
+                    }
+                    cfg_name = f"alpha={alpha:g}/l1={l1_ratio:g}"
+                    _record("ElasticNet", cfg_name, f"ElasticNet/{cfg_name}",
+                            {"alpha": float(alpha), "l1_ratio": float(l1_ratio),
+                             "max_iter": int(args.epochs), "elastic_tol": float(args.elastic_tol),
+                             "warm_path": True},
+                            adapter, metrics, idx)
+                continue
+
+            # General ElasticNet block: amortize coordinate descent across alphas
+            from sklearn.linear_model import MultiTaskElasticNet
+            u_fit = np.asarray(u_tr_np, dtype=np.float64)
+            r_fit = np.asarray(r_tr_np, dtype=np.float64)
+            enet = MultiTaskElasticNet(
+                l1_ratio=float(l1_ratio),
+                warm_start=True, max_iter=int(args.epochs), tol=float(args.elastic_tol),
+                selection=selection, random_state=rs,
             )
-            cfg_name = f"alpha={alpha:g}/l1={l1_ratio:g}"
-            label = f"ElasticNet/{cfg_name}"
-            _record("ElasticNet", cfg_name, label,
-                    {"alpha": float(alpha), "l1_ratio": float(l1_ratio),
-                     "max_iter": int(args.epochs)},
-                    adapter, metrics, idx)
+            for alpha in sorted(args.alphas, reverse=True):
+                idx += 1
+                print(
+                    f"    [linear] MultiTaskElasticNet  l1_ratio={l1_ratio:g}  alpha={alpha:g}  "
+                    f"(coordinate descent — can take tens of seconds; warm_start amortizes alphas)",
+                    flush=True,
+                )
+                t0 = time.time()
+                enet.set_params(alpha=float(alpha))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    enet.fit(u_fit, r_fit)
+                train_time = time.time() - t0
+                adapter = LinearResidualAdapter(ablation="none")
+                adapter.sklearn_model = copy.deepcopy(enet)
+                m = _eval_on_val(adapter, u_va, r_va, zr_va, zs_va, head, val_split, device)
+                metrics = {
+                    "val_residual_mse": m["residual_mse"],
+                    "val_latent_mse": m["latent_mse"],
+                    "val_auroc": m.get("auroc", float("nan")),
+                    "train_mse": float("nan"),
+                    "n_params": adapter.n_params,
+                    "train_time_s": train_time,
+                }
+                cfg_name = f"alpha={alpha:g}/l1={l1_ratio:g}"
+                _record("ElasticNet", cfg_name, f"ElasticNet/{cfg_name}",
+                        {"alpha": float(alpha), "l1_ratio": float(l1_ratio),
+                         "max_iter": int(args.epochs), "elastic_tol": float(args.elastic_tol),
+                         "warm_path": True},
+                        adapter, metrics, idx)
 
         # Ablation 1: prior_only (r=0, no fit). Recorded as its own method.
         idx += 1
@@ -344,13 +456,16 @@ def main():
             u_tr_np, r_tr_np, u_va, r_va, zr_va, zs_va, head, val_split, device,
             alpha=best_enet["alpha"], l1_ratio=best_enet["l1_ratio"],
             max_iter=args.epochs, ablation="single_lead_only",
+            elastic_tol=args.elastic_tol, random_state=rs, selection=selection,
+            progress="    [linear] single_lead_only ablation (re-fit) ...",
         )
         cfg_name = f"alpha={best_enet['alpha']:g}/l1={best_enet['l1_ratio']:g}"
         _record("single_lead_only", "single_lead_only",
                 f"single_lead_only/{cfg_name}",
                 {"alpha": float(best_enet["alpha"]),
                  "l1_ratio": float(best_enet["l1_ratio"]),
-                 "max_iter": int(args.epochs)},
+                 "max_iter": int(args.epochs),
+                 "elastic_tol": float(args.elastic_tol)},
                 adapter, metrics_single, idx)
 
     # Summary
