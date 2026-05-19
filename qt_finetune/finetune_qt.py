@@ -1,5 +1,8 @@
 """
-Fine-tune GraphECG encoder on QT interval regression (PTB-XL).
+Fine-tune GraphECG regression head on QT interval regression (PTB-XL).
+
+The pretrained encoder (GNN + waveform encoders) is FROZEN by default.
+Only the QT regression head (classifier) is trained.
 
 Endpoint: QT_Int_Global (ms) -- single scalar per recording.
 Resampling: 500 Hz -> 250 Hz (5000 -> 2500 samples).
@@ -8,8 +11,9 @@ Loss: MSE.
 Metrics: MSE, MAE, Pearson R (all per epoch).
 
 Usage:
-    python qt_finetune/finetune_qt.py --ptbxl-dir /path/to/ptbxl --smoke-test
-    python qt_finetune/finetune_qt.py --ptbxl-dir /path/to/ptbxl --epochs 30 --batch-size 32
+    python qt_finetune/finetune_qt.py --smoke-test
+    python qt_finetune/finetune_qt.py --epochs 30 --batch-size 32
+    python qt_finetune/finetune_qt.py --epochs 30 --unfreeze-encoder  # optional full FT
 """
 from __future__ import annotations
 
@@ -34,12 +38,20 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from ecg_gnn_simple import ECGGNNSimple
-from qt_dataset import QTFinetuneDataset, TARGET_LEN
+from qt_dataset import QTFinetuneDataset, TARGET_LEN, TABULAR_DIM
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
 DEFAULT_CHECKPOINT = _REPO_ROOT / "checkpoints" / "shd_pretrained.pt"
 DEFAULT_LABELS = _SCRIPT_DIR / "qt_labels.csv"
 DEFAULT_OUTPUT = _SCRIPT_DIR / "checkpoints"
+# Convenience defaults pointing to the two PTB-XL datasets under data/
+_DATA_DIR = _REPO_ROOT / "data"
+DEFAULT_SIGNALS_DIR = (
+    _DATA_DIR / "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1"
+)
+DEFAULT_FEATURES_DIR = (
+    _DATA_DIR / "ptb-xl-a-comprehensive-electrocardiographic-feature-dataset-1.0.1"
+)
 
 
 def create_model(pretrained_path, device):
@@ -50,7 +62,7 @@ def create_model(pretrained_path, device):
         edge_dim=192,
         hidden_dim=192,
         num_gnn_layers=3,
-        tabular_dim=7,
+        tabular_dim=TABULAR_DIM,
         dropout=0.3,
     )
 
@@ -73,6 +85,41 @@ def create_model(pretrained_path, device):
     return model.to(device)
 
 
+def freeze_encoder(model: nn.Module) -> tuple[int, int]:
+    """Freeze all parameters except ``classifier`` (regression head).
+
+    Frozen trunk modules stay in eval() during training so BatchNorm uses
+    running statistics and does not update.
+    """
+    n_frozen, n_trainable = 0, 0
+    for name, param in model.named_parameters():
+        if name.startswith("classifier"):
+            param.requires_grad = True
+            n_trainable += param.numel()
+        else:
+            param.requires_grad = False
+            n_frozen += param.numel()
+    return n_frozen, n_trainable
+
+
+def set_train_mode_head_only(model: nn.Module) -> None:
+    """Train the head; keep frozen encoder submodules in eval mode."""
+    model.classifier.train()
+    for name, child in model.named_children():
+        if name != "classifier":
+            child.eval()
+
+
+def head_parameters(model: nn.Module):
+    return [p for n, p in model.named_parameters()
+            if n.startswith("classifier") and p.requires_grad]
+
+
+def encoder_parameters(model: nn.Module):
+    return [p for n, p in model.named_parameters()
+            if not n.startswith("classifier") and p.requires_grad]
+
+
 def pearson_r(pred, target):
     if len(pred) < 2:
         return 0.0
@@ -83,20 +130,34 @@ def pearson_r(pred, target):
     return (num / den).item()
 
 
-def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
-    model.train()
-    mse_acc, mae_acc, r_acc, n = 0.0, 0.0, 0.0, 0
+def train_epoch(model, loader, optimizer, device, epoch, total_epochs, head_only: bool):
+    if head_only:
+        set_train_mode_head_only(model)
+    else:
+        model.train()
+    mse_acc, mae_acc, n = 0.0, 0.0, 0
     all_pred, all_tgt = [], []
-    pbar = tqdm(loader, desc=f"Train {epoch}/{total_epochs}", leave=False)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    pbar = tqdm(
+        loader,
+        desc=f"Train {epoch:>2}/{total_epochs}",
+        unit="batch",
+        leave=True,
+        dynamic_ncols=True,
+    )
     for batch_data, qt in pbar:
         batch_data = batch_data.to(device)
         qt = qt.to(device)
+        tabular = getattr(batch_data, "tabular", None)
+        if tabular is not None:
+            tabular = tabular.to(device)
 
-        optimizer.zero_grad()
-        pred = model(batch_data, tabular=None)["logits"]  # (B, 1)
+        optimizer.zero_grad(set_to_none=True)
+        pred = model(batch_data, tabular=tabular)["logits"]  # (B, 1)
         loss = nn.functional.mse_loss(pred, qt)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if trainable:
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         optimizer.step()
 
         mse_acc += loss.item()
@@ -104,7 +165,7 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
         all_pred.append(pred.detach().flatten())
         all_tgt.append(qt.flatten())
         n += 1
-        pbar.set_postfix(mse=f"{mse_acc/n:.2f}", mae=f"{mae_acc/n:.2f}")
+        pbar.set_postfix(mse=f"{mse_acc/n:.1f}", mae=f"{mae_acc/n:.1f}", refresh=False)
 
     all_pred = torch.cat(all_pred)
     all_tgt = torch.cat(all_tgt)
@@ -117,12 +178,21 @@ def eval_epoch(model, loader, device, epoch, total_epochs):
     model.eval()
     mse_acc, mae_acc, n = 0.0, 0.0, 0
     all_pred, all_tgt = [], []
-    pbar = tqdm(loader, desc=f"Val   {epoch}/{total_epochs}", leave=False)
+    pbar = tqdm(
+        loader,
+        desc=f"Val   {epoch:>2}/{total_epochs}",
+        unit="batch",
+        leave=True,
+        dynamic_ncols=True,
+    )
     for batch_data, qt in pbar:
         batch_data = batch_data.to(device)
         qt = qt.to(device)
+        tabular = getattr(batch_data, "tabular", None)
+        if tabular is not None:
+            tabular = tabular.to(device)
 
-        pred = model(batch_data, tabular=None)["logits"]
+        pred = model(batch_data, tabular=tabular)["logits"]
         mse_acc += nn.functional.mse_loss(pred, qt).item()
         mae_acc += (pred - qt).abs().mean().item()
         all_pred.append(pred.flatten())
@@ -138,8 +208,11 @@ def eval_epoch(model, loader, device, epoch, total_epochs):
 
 def smoke_test(args, device):
     print("=== Smoke test ===")
-    ds = QTFinetuneDataset(args.ptbxl_dir, args.labels_csv, "train",
-                           lead_dropout_prob=0.7)
+    ds = QTFinetuneDataset(
+        args.ptbxl_dir, args.labels_csv, "train",
+        ptbxl_features_dir=args.ptbxl_features_dir,
+        lead_dropout_prob=0.7,
+    )
     print(f"  Dataset: {len(ds)} samples")
 
     loader = PyGDataLoader(ds, batch_size=4, shuffle=True, num_workers=0)
@@ -148,9 +221,15 @@ def smoke_test(args, device):
     print(f"  QT targets  : {qt.shape}, values={qt.flatten().tolist()}")
 
     model = create_model(args.checkpoint, device)
-    model.train()
+    n_frozen, n_head = freeze_encoder(model)
+    print(f"  Frozen encoder params : {n_frozen:,}")
+    print(f"  Trainable head params   : {n_head:,}")
+    set_train_mode_head_only(model)
 
-    out = model(batch_data.to(device), tabular=None)
+    tabular = getattr(batch_data, "tabular", None)
+    if tabular is not None:
+        tabular = tabular.to(device)
+    out = model(batch_data.to(device), tabular=tabular)
     print(f"  Logits      : {out['logits'].shape}")
     print(f"  Graph embed : {out['graph_embed'].shape}")
 
@@ -158,10 +237,15 @@ def smoke_test(args, device):
     loss.backward()
     print(f"  Loss (MSE)  : {loss.item():.2f}")
 
-    grad_norm = sum(
-        p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None
+    enc_grad = sum(
+        p.grad.norm().item() ** 2 for p in encoder_parameters(model) if p.grad is not None
     ) ** 0.5
-    print(f"  Grad norm   : {grad_norm:.4f}")
+    head_grad = sum(
+        p.grad.norm().item() ** 2 for p in head_parameters(model) if p.grad is not None
+    ) ** 0.5
+    print(f"  Encoder grad norm (expect 0): {enc_grad:.6f}")
+    print(f"  Head grad norm              : {head_grad:.4f}")
+    assert enc_grad == 0.0, "Encoder received gradients -- freeze_encoder failed"
     print("=== Smoke test passed ===\n")
 
 
@@ -169,13 +253,30 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fine-tune GraphECG on QT interval regression (PTB-XL)"
     )
-    parser.add_argument("--ptbxl-dir", type=str, required=True,
-                        help="Path to PTB-XL root (contains records500/)")
+    parser.add_argument(
+        "--ptbxl-dir", type=str,
+        default=str(DEFAULT_SIGNALS_DIR),
+        help="Path to PTB-XL *signals* dataset root "
+             "(ptb-xl-a-large-publicly-available-...). Must contain records500/.",
+    )
+    parser.add_argument(
+        "--ptbxl-features-dir", type=str,
+        default=str(DEFAULT_FEATURES_DIR) if DEFAULT_FEATURES_DIR.exists() else None,
+        help="Optional path to PTB-XL *feature* dataset root "
+             "(ptb-xl-a-comprehensive-...). Supplies ecgdeli tabular features. "
+             "Defaults to the sibling directory under data/ if it exists.",
+    )
     parser.add_argument("--labels-csv", type=str, default=str(DEFAULT_LABELS))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--encoder-lr", type=float, default=5e-5)
-    parser.add_argument("--head-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--unfreeze-encoder", action="store_true",
+        help="Also fine-tune the GNN encoder (default: train regression head only).",
+    )
+    parser.add_argument("--encoder-lr", type=float, default=5e-5,
+                        help="LR for encoder when --unfreeze-encoder is set.")
+    parser.add_argument("--head-lr", type=float, default=1e-3,
+                        help="LR for the QT regression head (always trained).")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--checkpoint", type=str, default=str(DEFAULT_CHECKPOINT))
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT))
@@ -184,7 +285,12 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     if args.smoke_test:
@@ -195,11 +301,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Building datasets ...")
+    print(f"  Signals  : {args.ptbxl_dir}")
+    print(f"  Features : {args.ptbxl_features_dir or '(not provided -- tabular=zeros)'}")
     train_ds = QTFinetuneDataset(
         args.ptbxl_dir, args.labels_csv, "train",
+        ptbxl_features_dir=args.ptbxl_features_dir,
         lead_dropout_prob=args.lead_dropout,
     )
-    val_ds = QTFinetuneDataset(args.ptbxl_dir, args.labels_csv, "val")
+    val_ds = QTFinetuneDataset(
+        args.ptbxl_dir, args.labels_csv, "val",
+        ptbxl_features_dir=args.ptbxl_features_dir,
+    )
     print(f"  Train: {len(train_ds)}   Val: {len(val_ds)}")
 
     train_loader = PyGDataLoader(
@@ -212,36 +324,47 @@ def main():
     )
 
     model = create_model(args.checkpoint, device)
-    n_enc = sum(p.numel() for n, p in model.named_parameters()
-                if not n.startswith("classifier") and p.requires_grad)
-    n_head = sum(p.numel() for n, p in model.named_parameters()
-                 if n.startswith("classifier") and p.requires_grad)
-    print(f"  Encoder params : {n_enc:,}")
-    print(f"  Head params    : {n_head:,}")
+    head_only = not args.unfreeze_encoder
+    if head_only:
+        n_frozen, n_head = freeze_encoder(model)
+        print(f"  Mode: HEAD ONLY (encoder frozen, {n_frozen:,} params)")
+        print(f"  Trainable regression head: {n_head:,} params")
+        optimizer = AdamW(
+            head_parameters(model),
+            lr=args.head_lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        for p in model.parameters():
+            p.requires_grad = True
+        n_enc = sum(p.numel() for p in encoder_parameters(model))
+        n_head = sum(p.numel() for p in head_parameters(model))
+        print(f"  Mode: FULL fine-tune (encoder + head)")
+        print(f"  Encoder params : {n_enc:,}  @ lr={args.encoder_lr:g}")
+        print(f"  Head params    : {n_head:,}  @ lr={args.head_lr:g}")
+        optimizer = AdamW([
+            {"params": encoder_parameters(model), "lr": args.encoder_lr},
+            {"params": head_parameters(model), "lr": args.head_lr},
+        ], weight_decay=args.weight_decay)
 
-    enc_params = [p for n, p in model.named_parameters()
-                  if not n.startswith("classifier")]
-    head_params = [p for n, p in model.named_parameters()
-                   if n.startswith("classifier")]
-    optimizer = AdamW([
-        {"params": enc_params, "lr": args.encoder_lr},
-        {"params": head_params, "lr": args.head_lr},
-    ], weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_val_mae = float("inf")
-    hdr = (f"{'Ep':>3} {'Time':>5}  "
-           f"{'TrMSE':>8} {'TrMAE':>7} {'TrR':>6}  "
-           f"{'VaMSE':>8} {'VaMAE':>7} {'VaR':>6}")
-    print(f"\n{hdr}")
-    print("-" * len(hdr))
+    epoch_pbar = tqdm(
+        range(1, args.epochs + 1),
+        desc="Epochs",
+        unit="epoch",
+        dynamic_ncols=True,
+    )
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in epoch_pbar:
         t0 = time.time()
         tr_mse, tr_mae, tr_r = train_epoch(
-            model, train_loader, optimizer, device, epoch, args.epochs)
+            model, train_loader, optimizer, device, epoch, args.epochs, head_only,
+        )
         va_mse, va_mae, va_r = eval_epoch(
-            model, val_loader, device, epoch, args.epochs)
+            model, val_loader, device, epoch, args.epochs,
+        )
         scheduler.step()
         dt = time.time() - t0
 
@@ -253,18 +376,28 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_mae": va_mae, "val_mse": va_mse, "val_r": va_r,
+                "head_only": head_only,
                 "args": vars(args),
             }, output_dir / "best_qt_model.pt")
 
-        print(
-            f"{epoch:3d} {dt:5.1f}s  "
-            f"{tr_mse:8.2f} {tr_mae:7.2f} {tr_r:6.3f}  "
-            f"{va_mse:8.2f} {va_mae:7.2f} {va_r:6.3f}"
-            f"{'  *' if improved else ''}"
+        star = " *best*" if improved else ""
+        epoch_pbar.set_postfix(
+            time=f"{dt:.0f}s",
+            tr_mae=f"{tr_mae:.1f}",
+            va_mae=f"{va_mae:.1f}",
+            va_r=f"{va_r:.3f}",
+            refresh=True,
+        )
+        tqdm.write(
+            f"Epoch {epoch:>2}/{args.epochs}  {dt:5.1f}s  "
+            f"train MSE={tr_mse:.1f} MAE={tr_mae:.1f} R={tr_r:.3f}  |  "
+            f"val MSE={va_mse:.1f} MAE={va_mae:.1f} R={va_r:.3f}{star}"
         )
 
     print(f"\nBest val MAE: {best_val_mae:.2f} ms")
     print(f"Saved to {output_dir / 'best_qt_model.pt'}")
+    if head_only:
+        print("(checkpoint: frozen encoder + trained QT regression head)")
 
 
 if __name__ == "__main__":
