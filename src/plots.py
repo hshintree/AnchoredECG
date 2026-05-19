@@ -959,6 +959,12 @@ def _collect_model_predictions(val_split: dict, device,
 
     preds: dict[str, np.ndarray] = {}
 
+    # ---- Stress lead only: phi_stress -> regression head (no adapter) -------
+    preds["Stress lead only\n(no adapter)"] = np.asarray(
+        val_split["phi_stress"], dtype=np.float32,
+    )
+    print("  baseline: phi_stress -> regression head (no adapter)")
+
     # ---- Convex GReLU (with prior) -----------------------------------------
     gp = Path(args.grelu_ckpt)
     if gp.exists():
