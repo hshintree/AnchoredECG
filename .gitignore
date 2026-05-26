@@ -2,5 +2,5 @@ __pycache__/
 *.pyc
 *.egg-info/
 .DS_Store
-qt_finetune/checkpoints/
 qt_finetune/results/
+data/

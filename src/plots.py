@@ -773,6 +773,181 @@ def plot_baseline_vs_adapter(z_rest: np.ndarray, z_hat: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# PCA analysis
+# ---------------------------------------------------------------------------
+
+def plot_pca_analysis(linear_ckpt: Path, kernel_ckpt: Path,
+                      val_split: dict, device, out_dir: Path) -> None:
+    """PCA / SVD analysis for the Linear and Kernel Ridge adapters.
+
+    Linear adapter  →  figures/pca_linear.png
+      Panel 1: SVD spectrum of weight matrix W (192×384) — effective rank of
+               the learned linear map.
+      Panel 2: Val samples projected onto the top-2 PCs of z_stress (ground
+               truth), coloured by ischemia status.
+      Panel 3: The same projection applied to z_hat_linear — shows how well the
+               linear adapter preserves the principal structure of z_stress.
+
+    Kernel Ridge adapter  →  figures/pca_kernel.png  (skipped if no checkpoint)
+      The dual coefficients α (n_train × 192) are compact enough for exact PCA.
+      Panel 1: Explained variance of PCA on α — how many output directions the
+               kernel solution actually uses.
+      Panels 2–3: Val residuals (z_stress − z_rest) vs predicted residuals
+                  (z_hat_kernel − z_rest) in the top-2 PCs of the true residual,
+                  coloured by ischemia.
+    """
+    from sklearn.decomposition import PCA
+    import matplotlib.pyplot as plt
+
+    z_stress = val_split["z_stress"]   # (N, 192)
+    z_rest   = val_split["z_rest"]     # (N, 192)
+    y        = val_split["ischemia"].astype(int)
+
+    # ---- Linear adapter -----------------------------------------------------
+    if not linear_ckpt.exists():
+        print(f"  (no linear ckpt at {linear_ckpt} — skipping linear PCA)")
+    else:
+        lin = None
+        try:
+            from linear_adapter import load_linear
+            lin = load_linear(linear_ckpt)
+        except Exception as e:
+            print(f"  (skipping linear PCA: {e})")
+
+        if lin is not None and lin.sklearn_model is not None and \
+                hasattr(lin.sklearn_model, "coef_"):
+            W = np.asarray(lin.sklearn_model.coef_)   # (192, 384)
+            if W.ndim == 1:
+                W = W[np.newaxis, :]
+            sv = np.linalg.svd(W, compute_uv=False)   # (192,)
+            sv_norm = sv / (sv.sum() + 1e-12)
+            cum_sv  = np.cumsum(sv_norm)
+            eff90 = int(np.searchsorted(cum_sv, 0.90) + 1)
+            eff99 = int(np.searchsorted(cum_sv, 0.99) + 1)
+
+            # z_hat on val
+            u_va, _, zr_va, _ = build_tensors(val_split, device=device)
+            with torch.no_grad():
+                z_hat_lin = (zr_va + lin.to(device)(u_va)).cpu().numpy()
+
+            # PCA fit on z_stress, project both z_stress and z_hat
+            pca = PCA(n_components=2)
+            pca.fit(z_stress)
+            pc_stress = pca.transform(z_stress)
+            pc_hat    = pca.transform(z_hat_lin)
+
+            fig, axs = plt.subplots(1, 3, figsize=(16, 4.5))
+
+            # Panel 1 — SVD spectrum
+            axs[0].bar(np.arange(len(sv_norm)), sv_norm, color="steelblue", width=1.0)
+            ax2 = axs[0].twinx()
+            ax2.plot(np.arange(len(cum_sv)), cum_sv, "r-", lw=1.5)
+            ax2.axhline(0.90, color="r", ls="--", lw=1, alpha=0.5, label="90%")
+            ax2.axhline(0.99, color="orange", ls="--", lw=1, alpha=0.5, label="99%")
+            ax2.set_ylim(0, 1.05)
+            ax2.set_ylabel("Cumulative energy", color="r", fontsize=8)
+            ax2.legend(loc="center right", fontsize=7)
+            axs[0].set(xlabel="Singular value index",
+                       ylabel="Normalized singular value",
+                       title=f"SVD of W  (90% in {eff90} dims, 99% in {eff99} dims)")
+            axs[0].grid(True, axis="y", alpha=0.3)
+
+            # Panels 2 & 3 — PCA scatter
+            ev = pca.explained_variance_ratio_
+            for ax, pc, title in [
+                (axs[1], pc_stress, "z_stress  (ground truth)"),
+                (axs[2], pc_hat,    "z_hat  (linear adapter)"),
+            ]:
+                sc = ax.scatter(pc[:, 0], pc[:, 1], c=y, cmap="bwr",
+                                s=8, alpha=0.6, vmin=-0.5, vmax=1.5)
+                ax.set(xlabel=f"PC1 ({ev[0]:.1%})", ylabel=f"PC2 ({ev[1]:.1%})",
+                       title=title)
+                ax.grid(True, alpha=0.3)
+            plt.colorbar(sc, ax=axs[2], label="ischemia", ticks=[0, 1])
+
+            fig.suptitle("Linear adapter — PCA of latent space (val set, z_stress basis)",
+                         fontsize=12)
+            fig.tight_layout()
+            out = out_dir / "pca_linear.png"
+            fig.savefig(out, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  Linear W effective rank:  90%={eff90}   99%={eff99}")
+            print(f"  wrote {out}")
+
+    # ---- Kernel Ridge adapter -----------------------------------------------
+    if not kernel_ckpt.exists():
+        print(f"  (no kernel ckpt at {kernel_ckpt} — skipping kernel PCA)")
+        return
+    ker = None
+    try:
+        from kernel_adapter import load_kernel
+        ker = load_kernel(kernel_ckpt)
+    except Exception as e:
+        print(f"  (skipping kernel PCA: {e})")
+
+    if ker is None or ker.kernel_model is None or \
+            not hasattr(ker.kernel_model, "dual_coef_"):
+        print("  (kernel model not fitted — skipping kernel PCA)")
+        return
+
+    alpha = np.asarray(ker.kernel_model.dual_coef_)  # (n_train, 192)
+    n_comp = min(20, alpha.shape[0], alpha.shape[1])
+    pca_a  = PCA(n_components=n_comp).fit(alpha)
+    ev_a   = pca_a.explained_variance_ratio_
+    cum_a  = np.cumsum(ev_a)
+    eff90_a = int(np.searchsorted(cum_a, 0.90) + 1)
+
+    # z_hat_kernel on val
+    u_va, _, zr_va, _ = build_tensors(val_split, device=device)
+    with torch.no_grad():
+        z_hat_ker = (zr_va + ker.to(device)(u_va)).cpu().numpy()
+
+    # Residual PCA: fit on true residual, project both true and predicted
+    r_true = z_stress - z_rest
+    r_hat  = z_hat_ker - z_rest
+    pca_r  = PCA(n_components=2).fit(r_true)
+    pc_r_true = pca_r.transform(r_true)
+    pc_r_hat  = pca_r.transform(r_hat)
+    ev_r = pca_r.explained_variance_ratio_
+
+    fig, axs = plt.subplots(1, 3, figsize=(16, 4.5))
+
+    # Panel 1 — dual coefficient PCA explained variance
+    axs[0].bar(np.arange(n_comp), ev_a * 100, color="steelblue")
+    ax2 = axs[0].twinx()
+    ax2.plot(np.arange(n_comp), cum_a * 100, "r-", lw=1.5)
+    ax2.axhline(90, color="r", ls="--", lw=1, alpha=0.5)
+    ax2.set_ylim(0, 105)
+    ax2.set_ylabel("Cumulative variance (%)", color="r", fontsize=8)
+    axs[0].set(xlabel="Component", ylabel="Explained variance (%)",
+               title=f"PCA of dual coefficients α  ({alpha.shape[0]}×{alpha.shape[1]})\n"
+                     f"90% energy in {eff90_a} / {n_comp} components")
+    axs[0].grid(True, axis="y", alpha=0.3)
+
+    # Panels 2 & 3 — residual PCA scatter
+    for ax, pc, title in [
+        (axs[1], pc_r_true, "True residual  z_stress − z_rest"),
+        (axs[2], pc_r_hat,  f"Predicted residual  (kernel={ker.kernel_name})"),
+    ]:
+        sc = ax.scatter(pc[:, 0], pc[:, 1], c=y, cmap="bwr",
+                        s=8, alpha=0.6, vmin=-0.5, vmax=1.5)
+        ax.set(xlabel=f"Residual PC1 ({ev_r[0]:.1%})",
+               ylabel=f"Residual PC2 ({ev_r[1]:.1%})",
+               title=title)
+        ax.grid(True, alpha=0.3)
+    plt.colorbar(sc, ax=axs[2], label="ischemia", ticks=[0, 1])
+
+    fig.suptitle(f"Kernel Ridge — PCA of residual latent space (val set, kernel={ker.kernel_name})",
+                 fontsize=12)
+    fig.tight_layout()
+    out = out_dir / "pca_kernel.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Kernel dual-coef PCA:  90% energy in {eff90_a} / {n_comp} components")
+    print(f"  wrote {out}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -860,37 +1035,37 @@ def main():
     u_tr, *_ = build_tensors(sub, device=device, zero_prior=zero_prior)
 
     # ---- figures ------------------------------------------------------------
-    print("\n[1/14] neuron importance ...")
+    print("\n[1/15] neuron importance ...")
     plot_neuron_importance(adapter, out_dir / "neuron_importance.png")
 
-    print("\n[2/14] gate activation rates ...")
+    print("\n[2/15] gate activation rates ...")
     plot_gate_activation_rates(adapter, u_tr, out_dir / "gate_activation_rates.png")
 
-    print("\n[3/14] pruning sweep ...")
+    print("\n[3/15] pruning sweep ...")
     plot_pruning_sweep(Path(args.sweep_csv), out_dir / "pruning_sweep.png")
 
-    print("\n[4/14] ischemia ROC ...")
+    print("\n[4/15] ischemia ROC ...")
     pred_st80 = decode_st80(head, z_hat_va)
     scores = ischemia_patient_score(pred_st80, val_split["bl_st80"])
     plot_ischemia_roc(scores, val_split["ischemia"], out_dir / "ischemia_roc.png")
 
-    print("\n[5/14] per-dimension recovery ...")
+    print("\n[5/15] per-dimension recovery ...")
     plot_per_dim_recovery(z_hat_va, z_true_va, out_dir / "per_dim_recovery.png")
 
-    print("\n[6/14] recovery by label ...")
+    print("\n[6/15] recovery by label ...")
     plot_recovery_by_label(z_hat_va, z_true_va, val_split["ischemia"].astype(int),
                            out_dir / "recovery_by_label.png")
 
-    print("\n[7/14] baseline vs adapter ...")
+    print("\n[7/15] baseline vs adapter ...")
     plot_baseline_vs_adapter(z_rest_va, z_hat_va, z_true_va,
                              out_dir / "baseline_vs_adapter.png")
 
-    print("\n[8/14] per-lead ST80 Pearson ...")
+    print("\n[8/15] per-lead ST80 Pearson ...")
     plot_st80_per_lead_pearson(z_hat_va, z_true_va, val_split["bl_st80"], head,
                                out_dir / "st80_per_lead_pearson.png")
 
     latest_only = not args.all_runs
-    print("\n[9/14] sweep box plot (combined, GReLU vs MLP) ...")
+    print("\n[9/15] sweep box plot (combined, GReLU vs MLP) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot.png",
         min_runs=args.min_runs,
@@ -898,13 +1073,13 @@ def main():
         include_methods=args.include_methods,
         latest_only=latest_only,
     )
-    print("\n[10/14] sweep box plot (GReLU only) ...")
+    print("\n[10/15] sweep box plot (GReLU only) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot_grelu.png",
         min_runs=args.min_runs, include_configs=args.include_configs,
         include_methods=["GReLU"], latest_only=latest_only,
     )
-    print("\n[11/14] sweep box plot (MLP only) ...")
+    print("\n[11/15] sweep box plot (MLP only) ...")
     plot_sweep_boxplot(
         Path(args.sweep_jsonl), out_dir / "sweep_boxplot_mlp.png",
         min_runs=args.min_runs, include_configs=args.include_configs,
@@ -913,7 +1088,7 @@ def main():
 
     all_preds = _collect_model_predictions(val_split, device, args)
 
-    print("\n[12/14] model comparison (GReLU / GReLU 0prior / MLP) ...")
+    print("\n[12/15] model comparison (GReLU / GReLU 0prior / MLP) ...")
     cmp_keys = [
         "Convex GReLU\n(with prior)",
         "Convex GReLU\n(zero prior)",
@@ -927,7 +1102,7 @@ def main():
     else:
         print("  (no GReLU/MLP triplet checkpoints -- skipping compact comparison)")
 
-    print("\n[13/14] multi-method ischemia ROC overlay ...")
+    print("\n[13/15] multi-method ischemia ROC overlay ...")
     if len(all_preds) >= 1:
         scores_by_model = {}
         for name, z_hat in all_preds.items():
@@ -939,7 +1114,7 @@ def main():
     else:
         print("  (no checkpoints found for multi-method ROC)")
 
-    print("\n[14/14] multi-method per-lead Pearson (dST80) ...")
+    print("\n[14/15] multi-method per-lead Pearson (dST80) ...")
     if len(all_preds) >= 1:
         plot_multi_method_per_lead_pearson_panel(
             all_preds, z_true_va, val_split["bl_st80"], head,
@@ -948,6 +1123,12 @@ def main():
         )
     else:
         print("  (no checkpoints -- skipping per-lead Pearson panel)")
+
+    print("\n[15/15] PCA analysis (linear adapter + kernel ridge) ...")
+    plot_pca_analysis(
+        Path(args.linear_ckpt), Path(args.kernel_ckpt),
+        val_split, device, out_dir,
+    )
 
     print(f"\nAll figures written to {out_dir}/")
 
@@ -958,6 +1139,9 @@ def _collect_model_predictions(val_split: dict, device,
     """Load every adapter checkpoint named on the CLI; return z_hat (val) per model."""
 
     preds: dict[str, np.ndarray] = {}
+
+    # ---- No adapter: single lead embedding passed directly to regression head ----
+    preds["No adapter\n(single lead)"] = val_split["phi_stress"].astype(np.float32)
 
     # ---- Convex GReLU (with prior) -----------------------------------------
     gp = Path(args.grelu_ckpt)

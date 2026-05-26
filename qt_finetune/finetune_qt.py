@@ -13,7 +13,8 @@ Metrics: MSE, MAE, Pearson R (all per epoch).
 Usage:
     python qt_finetune/finetune_qt.py --smoke-test
     python qt_finetune/finetune_qt.py --epochs 30 --batch-size 32
-    python qt_finetune/finetune_qt.py --epochs 30 --unfreeze-encoder  # optional full FT
+    python qt_finetune/finetune_qt.py --epochs 30              # full fine-tune (default)
+    python qt_finetune/finetune_qt.py --epochs 30 --freeze-encoder  # head only
 """
 from __future__ import annotations
 
@@ -38,47 +39,49 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from ecg_gnn_simple import ECGGNNSimple
-from qt_dataset import QTFinetuneDataset, TARGET_LEN, TABULAR_DIM
+from qt_dataset import QTFinetuneDataset, TARGET_LEN
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
 DEFAULT_CHECKPOINT = _REPO_ROOT / "checkpoints" / "shd_pretrained.pt"
 DEFAULT_LABELS = _SCRIPT_DIR / "qt_labels.csv"
 DEFAULT_OUTPUT = _SCRIPT_DIR / "checkpoints"
-# Convenience defaults pointing to the two PTB-XL datasets under data/
 _DATA_DIR = _REPO_ROOT / "data"
 DEFAULT_SIGNALS_DIR = (
     _DATA_DIR / "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1"
 )
-DEFAULT_FEATURES_DIR = (
-    _DATA_DIR / "ptb-xl-a-comprehensive-electrocardiographic-feature-dataset-1.0.1"
-)
 
 
 def create_model(pretrained_path, device):
+    # tabular_dim=0: the base model's classifier will be replaced below.
+    # We pass 7 so the weight shapes in the pretrained checkpoint match,
+    # then immediately swap the classifier for the waveform-only head.
+    # input_length=5000: native 500 Hz PTB-XL (no downsampling).
+    # Conv weights are size-agnostic (AdaptiveAvgPool1d at the end),
+    # so pretrained 250 Hz weights transfer fine to 500 Hz input.
     model = ECGGNNSimple(
-        input_length=TARGET_LEN,
+        input_length=TARGET_LEN,   # 5000 samples @ 500 Hz
         sh_max_degree=4,
         node_dim=128,
         edge_dim=192,
         hidden_dim=192,
         num_gnn_layers=3,
-        tabular_dim=TABULAR_DIM,
+        tabular_dim=7,      # matches pretrained ckpt shape; overwritten below
         dropout=0.3,
     )
 
     if pretrained_path and Path(pretrained_path).exists():
         ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
         state = ckpt["model_state_dict"]
+        # Drop old classifier weights — we replace the head below
         state = {k: v for k, v in state.items() if not k.startswith("classifier")}
         missing, _ = model.load_state_dict(state, strict=False)
         print(f"Loaded pretrained encoder  (skipped: {missing})")
     else:
         print("WARNING: no pretrained checkpoint -- training from scratch")
 
-    # 199 = 192 hidden + 7 zero-padded tabular
-    # Single scalar output for QT interval
+    # Waveform-only head: 192-dim graph embed → 64 → 1 (no tabular)
     model.classifier = nn.Sequential(
-        nn.Linear(199, 64),
+        nn.Linear(192, 64),
         nn.Mish(inplace=True),
         nn.Linear(64, 1),
     )
@@ -148,10 +151,10 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs, head_only
     for batch_data, qt in pbar:
         batch_data = batch_data.to(device)
         qt = qt.to(device)
-        tabular = getattr(batch_data, "tabular", None)
-        if tabular is not None:
-            tabular = tabular.to(device)
 
+        # Pass an empty (B, 0) tabular so the model's cat() yields 192-dim (no padding)
+        B = batch_data.num_graphs
+        tabular = torch.zeros(B, 0, device=device)
         optimizer.zero_grad(set_to_none=True)
         pred = model(batch_data, tabular=tabular)["logits"]  # (B, 1)
         loss = nn.functional.mse_loss(pred, qt)
@@ -188,9 +191,8 @@ def eval_epoch(model, loader, device, epoch, total_epochs):
     for batch_data, qt in pbar:
         batch_data = batch_data.to(device)
         qt = qt.to(device)
-        tabular = getattr(batch_data, "tabular", None)
-        if tabular is not None:
-            tabular = tabular.to(device)
+        B = batch_data.num_graphs
+        tabular = torch.zeros(B, 0, device=device)
 
         pred = model(batch_data, tabular=tabular)["logits"]
         mse_acc += nn.functional.mse_loss(pred, qt).item()
@@ -210,7 +212,6 @@ def smoke_test(args, device):
     print("=== Smoke test ===")
     ds = QTFinetuneDataset(
         args.ptbxl_dir, args.labels_csv, "train",
-        ptbxl_features_dir=args.ptbxl_features_dir,
         lead_dropout_prob=0.7,
     )
     print(f"  Dataset: {len(ds)} samples")
@@ -226,9 +227,8 @@ def smoke_test(args, device):
     print(f"  Trainable head params   : {n_head:,}")
     set_train_mode_head_only(model)
 
-    tabular = getattr(batch_data, "tabular", None)
-    if tabular is not None:
-        tabular = tabular.to(device)
+    B = batch_data.num_graphs
+    tabular = torch.zeros(B, 0, device=device)
     out = model(batch_data.to(device), tabular=tabular)
     print(f"  Logits      : {out['logits'].shape}")
     print(f"  Graph embed : {out['graph_embed'].shape}")
@@ -259,22 +259,15 @@ def main():
         help="Path to PTB-XL *signals* dataset root "
              "(ptb-xl-a-large-publicly-available-...). Must contain records500/.",
     )
-    parser.add_argument(
-        "--ptbxl-features-dir", type=str,
-        default=str(DEFAULT_FEATURES_DIR) if DEFAULT_FEATURES_DIR.exists() else None,
-        help="Optional path to PTB-XL *feature* dataset root "
-             "(ptb-xl-a-comprehensive-...). Supplies ecgdeli tabular features. "
-             "Defaults to the sibling directory under data/ if it exists.",
-    )
     parser.add_argument("--labels-csv", type=str, default=str(DEFAULT_LABELS))
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
-        "--unfreeze-encoder", action="store_true",
-        help="Also fine-tune the GNN encoder (default: train regression head only).",
+        "--freeze-encoder", action="store_true",
+        help="Freeze the GNN encoder and train only the regression head.",
     )
     parser.add_argument("--encoder-lr", type=float, default=5e-5,
-                        help="LR for encoder when --unfreeze-encoder is set.")
+                        help="LR for encoder during full fine-tuning.")
     parser.add_argument("--head-lr", type=float, default=1e-3,
                         help="LR for the QT regression head (always trained).")
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -302,15 +295,14 @@ def main():
 
     print("Building datasets ...")
     print(f"  Signals  : {args.ptbxl_dir}")
-    print(f"  Features : {args.ptbxl_features_dir or '(not provided -- tabular=zeros)'}")
+    print(f"  Labels   : {args.labels_csv}")
+    print(f"  No tabular features — waveform-only model")
     train_ds = QTFinetuneDataset(
         args.ptbxl_dir, args.labels_csv, "train",
-        ptbxl_features_dir=args.ptbxl_features_dir,
         lead_dropout_prob=args.lead_dropout,
     )
     val_ds = QTFinetuneDataset(
         args.ptbxl_dir, args.labels_csv, "val",
-        ptbxl_features_dir=args.ptbxl_features_dir,
     )
     print(f"  Train: {len(train_ds)}   Val: {len(val_ds)}")
 
@@ -324,7 +316,7 @@ def main():
     )
 
     model = create_model(args.checkpoint, device)
-    head_only = not args.unfreeze_encoder
+    head_only = args.freeze_encoder
     if head_only:
         n_frozen, n_head = freeze_encoder(model)
         print(f"  Mode: HEAD ONLY (encoder frozen, {n_frozen:,} params)")
