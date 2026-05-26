@@ -63,8 +63,12 @@ from validate_qt import (
     ForcedLeadDataset, ICMLeadDataset, load_model, LIMB_LEAD_INDICES,
 )
 from qt_adapter import (
-    extract_latents, predict_from_latents,
-    LinearResidualAdapter, KernelResidualAdapter,
+    get_latents, predict_from_latents,
+    LinearResidualAdapter, KernelResidualAdapter, GReLUResidualAdapter,
+    save_linear, load_linear,
+    save_krr,    load_krr,
+    save_grelu,  load_grelu,
+    GRELU_DEFAULT_CONFIG,
 )
 
 # ---------------------------------------------------------------------------
@@ -85,14 +89,16 @@ PALETTE = {
     "ICM (V3−V2)":       "#AD1457",   # deep pink
     "Lead I + Linear":   "#FF8F00",   # amber  (adapter of Lead I)
     "Lead I + KRR":      "#6A1B9A",   # deep purple
+    "Lead I + GReLU":    "#00838F",   # teal
 }
 LS = {
-    "12-lead":          "-",
-    "6 limb leads":     "--",
-    "Lead I":           "-.",
-    "ICM (V3−V2)":      ":",
-    "Lead I + Linear":  (0, (3, 1, 1, 1)),   # dash-dot-dot
-    "Lead I + KRR":     (0, (5, 1)),          # densely dashed
+    "12-lead":           "-",
+    "6 limb leads":      "--",
+    "Lead I":            "-.",
+    "ICM (V3−V2)":       ":",
+    "Lead I + Linear":   (0, (3, 1, 1, 1)),   # dash-dot-dot
+    "Lead I + KRR":      (0, (5, 1)),          # densely dashed
+    "Lead I + GReLU":    (0, (1, 1)),          # densely dotted
 }
 
 # ---------------------------------------------------------------------------
@@ -433,12 +439,12 @@ def plot_prc_single_threshold(
     output_path: Path,
 ) -> None:
     """
-    PRC curves for all 4 lead configs using a SINGLE universal QTc threshold.
+    PRC curves for all configs using a SINGLE universal QTc threshold.
 
-    Unlike the default narrow/wide QRS rule, every sample here is labelled
-    positive if ref_qtc > threshold_ms, regardless of QRS duration.
-    This gives far higher prevalence (e.g. ~25% at 450 ms) and thus a
-    much more interpretable AUPRC.
+    Unlike the narrow/wide QRS rule, every sample is labelled positive if
+    ref_qtc > threshold_ms regardless of QRS duration.  This gives far
+    higher prevalence (~25% at 450 ms) and thus a much more interpretable
+    AUPRC.
 
     Not the primary analysis — call explicitly with --prc-450.
     """
@@ -494,6 +500,194 @@ def plot_prc_single_threshold(
 
 
 # ---------------------------------------------------------------------------
+# 6. Combined Pearson QTc  — all configs overlaid in one plot
+# ---------------------------------------------------------------------------
+
+def plot_pearson_combined(all_data: dict, output_path: Path,
+                          split: str = "val") -> None:
+    """
+    Single-axes scatter + regression overlay for every config in all_data.
+
+    Each config gets:
+      - A random subsample of 350 points (alpha=0.12) for density impression
+      - A regression line computed on the full split (lw=2.2)
+      - A legend entry with R and MAE
+    Identity line and QTc=500ms guide lines are shown in neutral colours.
+    """
+    fig, ax = plt.subplots(figsize=(9.5, 8.5))
+    rng = np.random.RandomState(42)
+
+    # First pass: global axis limits
+    lo, hi = float("inf"), float("-inf")
+    for d in all_data.values():
+        v = d["valid"]
+        lo = min(lo, d["ref_qtc"][v].min(), d["pred_qtc"][v].min())
+        hi = max(hi, d["ref_qtc"][v].max(), d["pred_qtc"][v].max())
+    lo -= 10; hi += 10
+
+    # Second pass: scatter + regression per config
+    for name, d in all_data.items():
+        v        = d["valid"]
+        ref_qtc  = d["ref_qtc"][v]
+        pred_qtc = d["pred_qtc"][v]
+        color    = PALETTE.get(name, "#555")
+        ls_style = LS.get(name, "-")
+
+        slope, intercept, r, _, _ = stats.linregress(ref_qtc, pred_qtc)
+        mae  = float(np.abs(pred_qtc - ref_qtc).mean())
+        rmse = float(np.sqrt(((pred_qtc - ref_qtc) ** 2).mean()))
+
+        # Subsample scatter — enough to show density without clutter
+        n   = len(ref_qtc)
+        idx = rng.choice(n, min(350, n), replace=False)
+        ax.scatter(ref_qtc[idx], pred_qtc[idx],
+                   s=5, alpha=0.13, color=color, linewidths=0, zorder=2)
+
+        xs = np.linspace(lo, hi, 300)
+        ax.plot(xs, slope * xs + intercept,
+                color=color, lw=2.3, ls=ls_style, zorder=3,
+                label=f"{name}  R={r:.3f}  MAE={mae:.1f} ms  RMSE={rmse:.1f} ms")
+
+    # Reference lines
+    ax.plot([lo, hi], [lo, hi], "--", color="#777", lw=1.3, alpha=0.7,
+            zorder=1, label="Identity (y = x)")
+    ax.axvline(500, color="#FF6F00", lw=0.9, ls=":", alpha=0.55, zorder=1)
+    ax.axhline(500, color="#FF6F00", lw=0.9, ls=":", alpha=0.55, zorder=1,
+               label="QTc = 500 ms (narrow QRS threshold)")
+
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Reference QTc (Bazett, 12SL RR) [ms]", fontsize=13)
+    ax.set_ylabel("Predicted QTc [ms]", fontsize=13)
+    ax.set_title(
+        f"Combined Pearson Correlation: Predicted QTc vs Reference QTc\n"
+        f"Split = {split}  (PTB-XL, waveform-only model, 500 Hz)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.legend(fontsize=9, loc="lower right", framealpha=0.93,
+              handlelength=2.5)
+    ax.grid(True, alpha=0.22, zorder=0)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Combined Pearson → {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# 7. Combined ROC curves  — all configs overlaid
+# ---------------------------------------------------------------------------
+
+def plot_roc_curves(all_data: dict, output_path: Path,
+                    split: str = "val") -> None:
+    """
+    Overlaid ROC curves for every config using the narrow/wide QRS
+    prolongation labels (Narrow QRS → QTc>500ms, Wide QRS → QTc>550ms).
+    """
+    from sklearn.metrics import roc_curve as _roc_curve
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    any_plotted = False
+
+    for name, d in all_data.items():
+        v       = d["valid"]
+        y_true  = (d["ref_qtc"][v] > d["threshold"][v]).astype(int)
+        y_score = d["pred_qtc"][v]
+        n_pos   = int(y_true.sum())
+
+        if n_pos < 5:
+            print(f"  ROC [{name}]: only {n_pos} positives — skipping")
+            continue
+
+        auc           = roc_auc_score(y_true, y_score)
+        fpr, tpr, _   = _roc_curve(y_true, y_score)
+        ax.plot(fpr, tpr,
+                color=PALETTE.get(name, "#555"), lw=2.5, ls=LS.get(name, "-"),
+                label=f"{name}   AUC = {auc:.3f}  (n+ = {n_pos})")
+        any_plotted = True
+
+    ax.plot([0, 1], [0, 1], "--", color="#aaa", lw=1.2,
+            label="No-skill baseline (AUC = 0.50)")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+    ax.set_xlabel("False Positive Rate (1 − Specificity)", fontsize=13)
+    ax.set_ylabel("True Positive Rate (Sensitivity)",      fontsize=13)
+    ax.set_title(
+        "ROC Curves — QTc Prolongation\n"
+        "Narrow QRS (≤100 ms) → QTc > 500 ms  |  Wide QRS (>100 ms) → QTc > 550 ms\n"
+        f"Split = {split}",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=9.5, loc="lower right", framealpha=0.92)
+    ax.grid(True, alpha=0.28)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ROC curves    → {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# 8. Combined PRC curves  — narrow/wide threshold, all configs overlaid
+# ---------------------------------------------------------------------------
+
+def plot_prc_curves(all_data: dict, output_path: Path,
+                    split: str = "val") -> None:
+    """
+    Overlaid Precision-Recall curves using the narrow/wide QRS prolongation
+    rule (same labels as the classification report).  Shows AUPRC and n+.
+    """
+    fig, ax = plt.subplots(figsize=(8, 7))
+    baseline_prev: float | None = None
+    any_plotted = False
+
+    for name, d in all_data.items():
+        v       = d["valid"]
+        y_true  = (d["ref_qtc"][v] > d["threshold"][v]).astype(int)
+        y_score = d["pred_qtc"][v]
+        n_pos   = int(y_true.sum())
+        n       = int(v.sum())
+
+        if n_pos < 5:
+            print(f"  PRC [{name}]: only {n_pos} positives — skipping")
+            continue
+
+        prev  = n_pos / n
+        if baseline_prev is None:
+            baseline_prev = prev
+
+        auprc        = average_precision_score(y_true, y_score)
+        prec, rec, _ = precision_recall_curve(y_true, y_score)
+        ax.plot(rec, prec,
+                color=PALETTE.get(name, "#555"), lw=2.5, ls=LS.get(name, "-"),
+                label=f"{name}   AUPRC = {auprc:.3f}  (n+ = {n_pos}, {prev:.1%})")
+        any_plotted = True
+
+    if baseline_prev is not None:
+        ax.axhline(baseline_prev, color="#aaa", lw=1.3, ls="--",
+                   label=f"No-skill baseline (prevalence = {baseline_prev:.1%})")
+
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+    ax.set_xlabel("Recall",    fontsize=13)
+    ax.set_ylabel("Precision", fontsize=13)
+    ax.set_title(
+        "Precision-Recall Curves — QTc Prolongation\n"
+        "Narrow QRS (≤100 ms) → QTc > 500 ms  |  Wide QRS (>100 ms) → QTc > 550 ms\n"
+        f"Split = {split}",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=9, loc="upper right", framealpha=0.92)
+    ax.grid(True, alpha=0.28)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  PRC curves    → {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -509,18 +703,53 @@ def main():
     parser.add_argument("--n-examples",   type=int, default=15,
                         help="Random rows to show in sample table")
     parser.add_argument("--prc-450",      action="store_true", default=False,
-                        help="One-off: also plot PRC at universal QTc>450ms threshold "
+                        help="One-off: plot PRC at universal QTc>450ms threshold "
                              "(higher prevalence, more interpretable AUPRC). Off by default.")
     parser.add_argument("--adapters",     action="store_true", default=False,
-                        help="Train Linear + KRR residual adapters (Lead I → 12-lead latent) "
-                             "on the training split and add them to all plots. "
-                             "Adds ~5-10 min for latent extraction on CPU.")
+                        help="Train any adapter whose checkpoint is missing, then include "
+                             "all three in every plot.  If all checkpoints already exist "
+                             "they are loaded automatically even without this flag — "
+                             "use --adapter-force-retrain to force a full retrain.")
+    # Adapter/latent cache dirs
+    parser.add_argument("--adapter-dir",        default=None,
+                        help="Dir for adapter checkpoints "
+                             "(default: qt_finetune/checkpoints/adapters/).")
+    parser.add_argument("--adapter-latent-dir", default=None,
+                        help="Dir for cached latent .npz files "
+                             "(default: qt_finetune/checkpoints/latents/). "
+                             "Shared with train_adapters.py --latent-dir.")
+    parser.add_argument("--adapter-force-retrain",   action="store_true", default=False,
+                        help="Re-train adapters even if checkpoints already exist.")
+    parser.add_argument("--force-reextract",         action="store_true", default=False,
+                        help="Re-extract encoder latents even if .npz caches exist "
+                             "(use after updating the model checkpoint).")
+    # Linear
     parser.add_argument("--adapter-alpha-linear", type=float, default=1.0,
-                        help="Ridge alpha for the linear adapter (default 1.0).")
+                        help="Ridge alpha for the linear adapter.")
+    # KRR
     parser.add_argument("--adapter-alpha-krr",    type=float, default=0.1,
-                        help="KernelRidge alpha for the KRR adapter (default 0.1).")
+                        help="KernelRidge alpha for the KRR adapter.")
     parser.add_argument("--adapter-nsub",         type=int,   default=3000,
-                        help="KRR training subsample size (default 3000).")
+                        help="KRR training subsample size.")
+    # GReLU — defaults come from GRELU_DEFAULT_CONFIG so they stay in sync
+    parser.add_argument("--grelu-m",          type=int,
+                        default=GRELU_DEFAULT_CONFIG["m"],
+                        help="Number of GReLU neurons.")
+    parser.add_argument("--grelu-epochs",     type=int,
+                        default=GRELU_DEFAULT_CONFIG["epochs"],
+                        help="R-FISTA iterations (default: %(default)s).")
+    parser.add_argument("--grelu-eval-every", type=int,
+                        default=GRELU_DEFAULT_CONFIG["eval_every"],
+                        help="Print progress every N iterations (default: %(default)s).")
+    parser.add_argument("--grelu-lr",         type=float,
+                        default=GRELU_DEFAULT_CONFIG["lr"],
+                        help="Initial R-FISTA step size.")
+    parser.add_argument("--grelu-lambda-l2",  type=float,
+                        default=GRELU_DEFAULT_CONFIG["lambda_l2"],
+                        help="L2 regularisation for GReLU.")
+    parser.add_argument("--grelu-lambda-l1",  type=float,
+                        default=GRELU_DEFAULT_CONFIG["lambda_l1"],
+                        help="L1 penalty on feature weights (0 = off).")
     args = parser.parse_args()
 
     # ── Checkpoint guard ──────────────────────────────────────────────────
@@ -579,49 +808,133 @@ def main():
         print(f"MAE={np.abs(err).mean():.2f} ms  R={np.corrcoef(pred_qt,tgt_qt)[0,1]:.3f}")
         all_data[name] = d
 
-    # ── Latent adapters (optional) ────────────────────────────────────────
-    if args.adapters:
-        print("\n── Latent Adapters (Lead I → 12-lead residual) ──────────────")
+    # ── Latent adapters ───────────────────────────────────────────────────
+    # Auto-detect: if any adapter checkpoint already exists on disk, load and
+    # include it automatically — no flag needed.
+    # Pass --adapters to (re-)train any missing adapter from scratch.
+    # Pass --adapter-force-retrain to force retraining all three.
+    import os as _os
 
-        train_kwargs = dict(
-            ptbxl_signals_dir=args.ptbxl_dir,
-            labels_csv=args.labels_csv,
-            split="train",
-        )
+    _ckpt_dir   = (Path(args.adapter_dir)        if args.adapter_dir
+                   else _SCRIPT_DIR / "checkpoints" / "adapters")
+    _latent_dir = (Path(args.adapter_latent_dir) if args.adapter_latent_dir
+                   else _SCRIPT_DIR / "checkpoints" / "latents")
+    _linear_ckpt = _ckpt_dir / "linear_adapter.pkl"
+    _krr_ckpt    = _ckpt_dir / "krr_adapter.pkl"
+    _grelu_ckpt  = _ckpt_dir / "grelu_adapter.pt"
+    _force_ada   = args.adapter_force_retrain
+    _force_lat   = args.force_reextract
 
-        print("  Extracting 12-lead training latents ...")
-        z12_tr, _, _, _ = extract_latents(
-            model,
-            ForcedLeadDataset(lead_indices=list(range(12)), **train_kwargs),
-            device, args.batch_size, desc="12-lead train",
-        )
-        print("  Extracting Lead I training latents ...")
-        zi_tr, _, _, _ = extract_latents(
-            model,
-            ForcedLeadDataset(lead_indices=[0], **train_kwargs),
-            device, args.batch_size, desc="Lead I train",
-        )
+    # Which adapters exist on disk right now?
+    _cached = {
+        "Lead I + Linear": _linear_ckpt.exists() and not _force_ada,
+        "Lead I + KRR":    _krr_ckpt.exists()    and not _force_ada,
+        "Lead I + GReLU":  _grelu_ckpt.exists()  and not _force_ada,
+    }
+    _any_cached   = any(_cached.values())
+    _need_to_train = args.adapters  # only train when explicitly requested
 
-        print("  Fitting Linear adapter ...")
-        linear_adapter = LinearResidualAdapter(alpha=args.adapter_alpha_linear).fit(zi_tr, z12_tr)
+    # Run the adapter block when: at least one checkpoint exists OR --adapters passed
+    if _any_cached or _need_to_train:
+        _ckpt_dir.mkdir(parents=True, exist_ok=True)
+        _latent_dir.mkdir(parents=True, exist_ok=True)
+        _ckpt_mtime = _os.path.getmtime(ckpt_path)
 
-        print("  Fitting KRR adapter ...")
-        krr_adapter = KernelResidualAdapter(
-            alpha=args.adapter_alpha_krr,
-            n_subsample=args.adapter_nsub,
-        ).fit(zi_tr, z12_tr)
+        _cached_label  = ", ".join(k.replace("Lead I + ", "") for k, v in _cached.items() if v)
+        _missing_label = ", ".join(k.replace("Lead I + ", "") for k, v in _cached.items() if not v)
+        print(f"\n── Latent Adapters ───────────────────────────────────────────")
+        if _cached_label:
+            print(f"  cached : {_cached_label}")
+        if _missing_label and _need_to_train:
+            print(f"  to train: {_missing_label}")
+        elif _missing_label:
+            print(f"  skipping (no checkpoint): {_missing_label}  → pass --adapters to train")
 
-        print("  Extracting Lead I validation latents ...")
-        zi_val, _, tgt_qt_val, ecg_ids_val = extract_latents(
+        # Training latents: only needed if we will train at least one adapter
+        _will_train_any = _need_to_train and not all(_cached.values())
+        z12_tr = zi_tr = None
+        if _will_train_any:
+            def _ds_train(leads):
+                return ForcedLeadDataset(
+                    lead_indices=leads,
+                    ptbxl_signals_dir=args.ptbxl_dir,
+                    labels_csv=args.labels_csv,
+                    split="train",
+                )
+            z12_tr, _, _, _ = get_latents(
+                model, _ds_train(list(range(12))), device, args.batch_size,
+                cache_path=_latent_dir / "train_12lead.npz",
+                ckpt_mtime=_ckpt_mtime, force=_force_lat,
+                desc="12-lead train",
+            )
+            zi_tr, _, _, _ = get_latents(
+                model, _ds_train([0]), device, args.batch_size,
+                cache_path=_latent_dir / "train_leadI.npz",
+                ckpt_mtime=_ckpt_mtime, force=_force_lat,
+                desc="Lead I train",
+            )
+
+        # Val/test latents for adapter inference (always needed here)
+        zi_val, _, tgt_qt_val, ecg_ids_val = get_latents(
             model,
             ForcedLeadDataset(lead_indices=[0], **ds_kwargs),
-            device, args.batch_size, desc=f"Lead I {args.split}",
+            device, args.batch_size,
+            cache_path=_latent_dir / f"{args.split}_leadI.npz",
+            ckpt_mtime=_ckpt_mtime, force=_force_lat,
+            desc=f"Lead I {args.split}",
         )
 
-        for aname, adapter in [
-            ("Lead I + Linear", linear_adapter),
-            ("Lead I + KRR",    krr_adapter),
+        # ── Load or train each adapter ────────────────────────────────────
+        def _resolve_linear():
+            if _cached["Lead I + Linear"]:
+                return load_linear(_linear_ckpt)
+            if _need_to_train:
+                print(f"  Linear: fitting  alpha={args.adapter_alpha_linear}")
+                a = LinearResidualAdapter(alpha=args.adapter_alpha_linear).fit(zi_tr, z12_tr)
+                save_linear(a, _linear_ckpt)
+                return a
+            return None
+
+        def _resolve_krr():
+            if _cached["Lead I + KRR"]:
+                return load_krr(_krr_ckpt)
+            if _need_to_train:
+                print(f"  KRR: fitting  alpha={args.adapter_alpha_krr}  n_sub={args.adapter_nsub}")
+                a = KernelResidualAdapter(
+                    alpha=args.adapter_alpha_krr, n_subsample=args.adapter_nsub,
+                ).fit(zi_tr, z12_tr)
+                save_krr(a, _krr_ckpt)
+                return a
+            return None
+
+        def _resolve_grelu():
+            if _cached["Lead I + GReLU"]:
+                return load_grelu(_grelu_ckpt)
+            if _need_to_train:
+                print(
+                    f"  GReLU: training  m={args.grelu_m}  epochs={args.grelu_epochs}  "
+                    f"eval_every={args.grelu_eval_every}  lr={args.grelu_lr:.0e}  "
+                    f"λ_l2={args.grelu_lambda_l2:.0e}  λ_l1={args.grelu_lambda_l1:.0e}"
+                )
+                a = GReLUResidualAdapter(
+                    m=args.grelu_m, lr=args.grelu_lr, epochs=args.grelu_epochs,
+                    eval_every=args.grelu_eval_every,
+                    lambda_l2=args.grelu_lambda_l2, lambda_l1=args.grelu_lambda_l1,
+                    device=str(device),
+                ).fit(zi_tr, z12_tr, verbose=True)
+                save_grelu(a, _grelu_ckpt)
+                return a
+            return None
+
+        # ── Apply each resolved adapter ───────────────────────────────────
+        for aname, resolver in [
+            ("Lead I + Linear", _resolve_linear),
+            ("Lead I + KRR",    _resolve_krr),
+            ("Lead I + GReLU",  _resolve_grelu),
         ]:
+            adapter = resolver()
+            if adapter is None:
+                continue   # checkpoint missing and --adapters not passed → skip
             z_adapted   = adapter.transform(zi_val)
             pred_qt_ada = predict_from_latents(model, z_adapted, device)
             d_ada       = add_qtc(pred_qt_ada, tgt_qt_val, ecg_ids_val, meta)
@@ -639,19 +952,42 @@ def main():
 
     # ── Plots ─────────────────────────────────────────────────────────────
     out = Path(args.output_dir)
+    sp  = args.split
     print("── Generating plots ──────────────────────────────────────────")
-    plot_bland_altman(all_data, out / f"qtc_bland_altman_{args.split}.png")
-    plot_pearson_qtc( all_data, out / f"qtc_pearson_{args.split}.png")
 
+    # Per-config diagnostic grids (unchanged from before)
+    plot_bland_altman(all_data, out / f"qtc_bland_altman_{sp}.png")
+    plot_pearson_qtc( all_data, out / f"qtc_pearson_grid_{sp}.png")
+
+    # ── Combined / overlaid plots (new) ──────────────────────────────────
+    plot_pearson_combined(
+        all_data,
+        out / f"qtc_pearson_combined_{sp}.png",
+        split=sp,
+    )
+    plot_roc_curves(
+        all_data,
+        out / f"qtc_roc_{sp}.png",
+        split=sp,
+    )
+    plot_prc_curves(
+        all_data,
+        out / f"qtc_prc_{sp}.png",
+        split=sp,
+    )
+
+    # ── 450 ms ablation PRC (opt-in only) ────────────────────────────────
     if args.prc_450:
-        print("\n── One-off PRC at QTc > 450 ms ──────────────────────────────")
+        print("\n── PRC ablation: QTc > 450 ms (universal threshold) ──────────")
         plot_prc_single_threshold(
             all_data,
             threshold_ms=450.0,
-            output_path=out / f"qtc_prc_450ms_{args.split}.png",
+            output_path=out / f"qtc_prc_450ms_{sp}.png",
         )
 
-    print(f"\nAll plots saved to {out}/")
+    print(f"\nOutputs ({out}/):")
+    for f in sorted(out.glob(f"qtc_*_{sp}.png")):
+        print(f"  {f.name}")
 
 
 if __name__ == "__main__":
