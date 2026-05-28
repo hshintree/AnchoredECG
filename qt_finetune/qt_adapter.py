@@ -7,10 +7,13 @@ the same residual formulation as the ST-segment adapters in src/:
     r_i = z_12lead_i - z_lead_i             (residual to predict)
     z_12lead_hat = z_lead_i + adapter(z_lead_i)
 
-Three adapter families, matching the ST experiments:
-  Linear  : Ridge regression         (l1_ratio = 0 in the ST ElasticNet sweep)
-  Kernel  : KernelRidge + RBF kernel + StandardScaler  (same as kernel_adapter.py)
-  GReLU   : Convex fixed-gate GReLU network + R-FISTA  (same as grelu_adapter.py)
+Six adapter families:
+  Linear    : Ridge regression         (l1_ratio = 0 in the ST ElasticNet sweep)
+  Kernel    : KernelRidge + RBF kernel + StandardScaler  (same as kernel_adapter.py)
+  GReLU     : Convex fixed-gate GReLU network + R-FISTA  (same as grelu_adapter.py)
+  MLP       : 3-layer MLP (GELU + Dropout) trained with AdamW + CosineAnnealingLR
+  Attention : Reshape (192→12×16) → TransformerEncoder (pre-norm) → project back
+  LoRA      : Low-rank adapter B(A(z))·(α/r); A~Kaiming, B=0 init
 
 Key differences from the ST adapters:
   - Input is z_lead_i alone (192-dim), not concat(phi_stress, z_rest) (384-dim)
@@ -23,23 +26,35 @@ Latent caching (avoids re-running the encoder on every invocation):
                                   Embeds checkpoint mtime; warns if cache is stale.
 
 Checkpoint helpers (save / load):
-  save_linear / load_linear   — joblib pickle of LinearResidualAdapter
-  save_krr    / load_krr      — joblib pickle of KernelResidualAdapter
-  save_grelu  / load_grelu    — torch.save / torch.load of GReLUResidualAdapter
+  save_linear / load_linear     — joblib pickle of LinearResidualAdapter
+  save_krr    / load_krr        — joblib pickle of KernelResidualAdapter
+  save_grelu  / load_grelu      — torch.save / torch.load of GReLUResidualAdapter
+  save_mlp    / load_mlp        — torch.save / torch.load of MLPResidualAdapter
+  save_attention / load_attention — torch.save / torch.load of AttentionResidualAdapter
+  save_lora   / load_lora       — torch.save / torch.load of LoRAResidualAdapter
 
 Usage (imported by analyze_qtc.py and train_adapters.py):
     from qt_adapter import get_latents, predict_from_latents
-    from qt_adapter import LinearResidualAdapter, KernelResidualAdapter, GReLUResidualAdapter
-    from qt_adapter import save_linear, load_linear, save_krr, load_krr, save_grelu, load_grelu
+    from qt_adapter import (LinearResidualAdapter, KernelResidualAdapter,
+                            GReLUResidualAdapter, MLPResidualAdapter,
+                            AttentionResidualAdapter, LoRAResidualAdapter)
+    from qt_adapter import (save_linear, load_linear, save_krr, load_krr,
+                            save_grelu, load_grelu, save_mlp, load_mlp,
+                            save_attention, load_attention, save_lora, load_lora)
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import joblib
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader as TorchDataLoader, TensorDataset
 from sklearn.linear_model import Ridge
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.preprocessing import StandardScaler
@@ -743,4 +758,743 @@ def load_krr(path: str | Path) -> KernelResidualAdapter:
     """Load a KernelResidualAdapter from *path*."""
     adapter = joblib.load(path)
     print(f"    KRR adapter loaded ← {path}")
+    return adapter
+
+
+# ---------------------------------------------------------------------------
+# Shared mini-batch training loop for neural adapters (MLP, Attention, LoRA)
+# ---------------------------------------------------------------------------
+
+def _train_nn_adapter(
+    net: nn.Module,
+    z_src_tr: torch.Tensor,
+    r_tr: torch.Tensor,
+    *,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    batch_size: int,
+    device: torch.device,
+    eval_every: int,
+    z_src_val: torch.Tensor | None = None,
+    r_val: torch.Tensor | None = None,
+    verbose: bool = True,
+    name: str = "NN",
+) -> nn.Module:
+    """
+    Mini-batch AdamW + CosineAnnealingLR training loop for MLP/Attention/LoRA.
+
+    If *z_src_val* / *r_val* are supplied the best state (lowest val residual
+    MSE) is restored at the end of training.
+
+    Returns *net* in eval() mode on CPU.
+    """
+    net = net.to(device)
+    optimizer = AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 1e-3)
+
+    ds = TensorDataset(z_src_tr, r_tr)
+    loader = TorchDataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    has_val = (z_src_val is not None) and (r_val is not None)
+    best_val_mse = float("inf")
+    best_sd: dict | None = None
+
+    for epoch in range(1, epochs + 1):
+        net.train()
+        for zb, rb in loader:
+            zb = zb.to(device)
+            rb = rb.to(device)
+            optimizer.zero_grad()
+            loss = F.mse_loss(net(zb), rb)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        do_eval = (epoch % eval_every == 0 or epoch == epochs)
+        if do_eval:
+            net.eval()
+            with torch.no_grad():
+                tr_mse = F.mse_loss(
+                    net(z_src_tr.to(device)), r_tr.to(device)
+                ).item()
+                if has_val:
+                    vr_hat  = net(z_src_val.to(device))
+                    val_mse = F.mse_loss(vr_hat, r_val.to(device)).item()
+                    if val_mse < best_val_mse:
+                        best_val_mse = val_mse
+                        best_sd = {k: v.clone() for k, v in net.state_dict().items()}
+            if verbose:
+                if has_val:
+                    print(
+                        f"    {name} epoch {epoch:4d}  "
+                        f"train_mse={tr_mse:.6f}  val_mse={val_mse:.6f}"
+                    )
+                else:
+                    print(
+                        f"    {name} epoch {epoch:4d}  train_mse={tr_mse:.6f}"
+                    )
+
+    if has_val and best_sd is not None:
+        net.load_state_dict(best_sd)
+        if verbose:
+            print(f"    {name}: restored best checkpoint (val_mse={best_val_mse:.6f})")
+
+    return net.cpu().eval()
+
+
+# ---------------------------------------------------------------------------
+# MLP Residual Adapter
+# ---------------------------------------------------------------------------
+
+class _MLPNet(nn.Module):
+    """
+    Three-layer MLP with GELU activations and Dropout.
+
+    Architecture:
+        Linear(d_input → hidden) → GELU → Dropout(p)
+        Linear(hidden  → hidden) → GELU → Dropout(p)
+        Linear(hidden  → d_output)
+    """
+
+    def __init__(
+        self,
+        d_input: int,
+        d_output: int,
+        hidden: int = 512,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_input, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_output),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+MLP_DEFAULT_CONFIG: dict = {
+    "d_input":      192,
+    "d_output":     192,
+    "hidden":       512,
+    "dropout":      0.1,
+    "lr":           1e-3,
+    "weight_decay": 1e-4,
+    "epochs":       200,
+    "eval_every":   20,
+    "batch_size":   256,
+    "seed":         42,
+}
+
+
+class MLPResidualAdapter:
+    """
+    Three-layer MLP residual adapter trained with AdamW + CosineAnnealingLR.
+
+    Numpy-facing interface matching the other adapter classes:
+
+        adapter = MLPResidualAdapter(...)
+        adapter.fit(z_src_tr, z_tgt_tr)
+        z_adapted = adapter.transform(z_src_val)
+    """
+
+    def __init__(
+        self,
+        hidden: int        = 512,
+        dropout: float     = 0.1,
+        lr: float          = 1e-3,
+        weight_decay: float = 1e-4,
+        epochs: int        = 200,
+        eval_every: int    = 20,
+        batch_size: int    = 256,
+        seed: int          = 42,
+        device: str | None = None,
+    ):
+        self.hidden       = hidden
+        self.dropout      = dropout
+        self.lr           = lr
+        self.weight_decay = weight_decay
+        self.epochs       = epochs
+        self.eval_every   = eval_every
+        self.batch_size   = batch_size
+        self.seed         = seed
+        self._device_str  = device
+        self._net: _MLPNet | None = None
+
+    def _pick_device(self) -> torch.device:
+        if self._device_str is not None:
+            return torch.device(self._device_str)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    def fit(
+        self,
+        z_src: np.ndarray,
+        z_tgt: np.ndarray,
+        z_src_val: np.ndarray | None = None,
+        z_tgt_val: np.ndarray | None = None,
+        verbose: bool = True,
+    ) -> "MLPResidualAdapter":
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        z_src = z_src.astype(np.float32)
+        z_tgt = z_tgt.astype(np.float32)
+        r_tr  = z_tgt - z_src
+        d_in, d_out = z_src.shape[1], r_tr.shape[1]
+        device = self._pick_device()
+
+        net = _MLPNet(d_in, d_out, hidden=self.hidden, dropout=self.dropout)
+
+        zs_val_t = rs_val_t = None
+        if z_src_val is not None and z_tgt_val is not None:
+            zs_val_t = torch.tensor(z_src_val.astype(np.float32))
+            rs_val_t = torch.tensor((z_tgt_val - z_src_val).astype(np.float32))
+
+        self._net = _train_nn_adapter(
+            net,
+            torch.tensor(z_src), torch.tensor(r_tr),
+            epochs=self.epochs, lr=self.lr, weight_decay=self.weight_decay,
+            batch_size=self.batch_size, device=device, eval_every=self.eval_every,
+            z_src_val=zs_val_t, r_val=rs_val_t,
+            verbose=verbose, name="MLP",
+        )
+        self._d_input  = d_in
+        self._d_output = d_out
+
+        with torch.no_grad():
+            r_hat = self._net(torch.tensor(z_src))
+            mse   = F.mse_loss(r_hat, torch.tensor(r_tr)).item()
+        print(f"    MLPResidualAdapter: train residual MSE = {mse:.5f}")
+        return self
+
+    def transform(self, z_src: np.ndarray) -> np.ndarray:
+        assert self._net is not None, "Call fit() (or load_mlp()) before transform()"
+        z_src = z_src.astype(np.float32)
+        with torch.no_grad():
+            r_hat = self._net(torch.tensor(z_src)).numpy()
+        return (z_src + r_hat).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Attention Residual Adapter
+# ---------------------------------------------------------------------------
+
+class _AttentionNet(nn.Module):
+    """
+    Token-based self-attention residual adapter.
+
+    Reshapes the d_input-dim latent into n_tokens × token_dim, applies
+    n_layers × TransformerEncoderLayer (pre-norm, batch_first), flattens,
+    then projects back to d_input via a final linear layer.
+
+    Architecture:
+        Reshape (B, d_input) → (B, n_tokens, token_dim)
+        + learned positional embedding (1, n_tokens, token_dim)
+        → n_layers × TransformerEncoderLayer(d_model=token_dim, nhead=nhead,
+              dim_feedforward=dim_feedforward, dropout=dropout,
+              batch_first=True, norm_first=True)
+        → Flatten → Linear(d_input, d_input)
+
+    Default for d_input=192: 12 tokens × 16-dim, nhead=4.
+    """
+
+    def __init__(
+        self,
+        d_input: int       = 192,
+        n_tokens: int      = 12,
+        token_dim: int     = 16,
+        nhead: int         = 4,
+        n_layers: int      = 2,
+        dim_feedforward: int = 64,
+        dropout: float     = 0.1,
+    ):
+        super().__init__()
+        assert d_input == n_tokens * token_dim, (
+            f"d_input ({d_input}) must equal n_tokens ({n_tokens}) × "
+            f"token_dim ({token_dim})"
+        )
+        self.n_tokens  = n_tokens
+        self.token_dim = token_dim
+
+        self.pos_emb = nn.Parameter(torch.zeros(1, n_tokens, token_dim))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=token_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.proj    = nn.Linear(d_input, d_input)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B      = x.shape[0]
+        tokens = x.view(B, self.n_tokens, self.token_dim) + self.pos_emb
+        tokens = self.encoder(tokens)
+        return self.proj(tokens.reshape(B, -1))
+
+
+ATTENTION_DEFAULT_CONFIG: dict = {
+    "d_input":        192,
+    "n_tokens":       12,
+    "token_dim":      16,
+    "nhead":          4,
+    "n_layers":       2,
+    "dim_feedforward": 64,
+    "dropout":        0.1,
+    "lr":             1e-3,
+    "weight_decay":   1e-4,
+    "epochs":         200,
+    "eval_every":     20,
+    "batch_size":     256,
+    "seed":           42,
+}
+
+
+class AttentionResidualAdapter:
+    """
+    Self-attention residual adapter (reshape → TransformerEncoder → project).
+
+    Numpy-facing interface matching the other adapter classes:
+
+        adapter = AttentionResidualAdapter(...)
+        adapter.fit(z_src_tr, z_tgt_tr)
+        z_adapted = adapter.transform(z_src_val)
+    """
+
+    def __init__(
+        self,
+        n_tokens: int        = 12,
+        token_dim: int       = 16,
+        nhead: int           = 4,
+        n_layers: int        = 2,
+        dim_feedforward: int = 64,
+        dropout: float       = 0.1,
+        lr: float            = 1e-3,
+        weight_decay: float  = 1e-4,
+        epochs: int          = 200,
+        eval_every: int      = 20,
+        batch_size: int      = 256,
+        seed: int            = 42,
+        device: str | None   = None,
+    ):
+        self.n_tokens        = n_tokens
+        self.token_dim       = token_dim
+        self.nhead           = nhead
+        self.n_layers        = n_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout         = dropout
+        self.lr              = lr
+        self.weight_decay    = weight_decay
+        self.epochs          = epochs
+        self.eval_every      = eval_every
+        self.batch_size      = batch_size
+        self.seed            = seed
+        self._device_str     = device
+        self._net: _AttentionNet | None = None
+
+    def _pick_device(self) -> torch.device:
+        if self._device_str is not None:
+            return torch.device(self._device_str)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    def fit(
+        self,
+        z_src: np.ndarray,
+        z_tgt: np.ndarray,
+        z_src_val: np.ndarray | None = None,
+        z_tgt_val: np.ndarray | None = None,
+        verbose: bool = True,
+    ) -> "AttentionResidualAdapter":
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        z_src = z_src.astype(np.float32)
+        z_tgt = z_tgt.astype(np.float32)
+        r_tr  = z_tgt - z_src
+        d_in, d_out = z_src.shape[1], r_tr.shape[1]
+        device = self._pick_device()
+
+        net = _AttentionNet(
+            d_input=d_in,
+            n_tokens=self.n_tokens, token_dim=self.token_dim,
+            nhead=self.nhead, n_layers=self.n_layers,
+            dim_feedforward=self.dim_feedforward, dropout=self.dropout,
+        )
+
+        zs_val_t = rs_val_t = None
+        if z_src_val is not None and z_tgt_val is not None:
+            zs_val_t = torch.tensor(z_src_val.astype(np.float32))
+            rs_val_t = torch.tensor((z_tgt_val - z_src_val).astype(np.float32))
+
+        self._net = _train_nn_adapter(
+            net,
+            torch.tensor(z_src), torch.tensor(r_tr),
+            epochs=self.epochs, lr=self.lr, weight_decay=self.weight_decay,
+            batch_size=self.batch_size, device=device, eval_every=self.eval_every,
+            z_src_val=zs_val_t, r_val=rs_val_t,
+            verbose=verbose, name="Attention",
+        )
+        self._d_input  = d_in
+        self._d_output = d_out
+
+        with torch.no_grad():
+            r_hat = self._net(torch.tensor(z_src))
+            mse   = F.mse_loss(r_hat, torch.tensor(r_tr)).item()
+        print(f"    AttentionResidualAdapter: train residual MSE = {mse:.5f}")
+        return self
+
+    def transform(self, z_src: np.ndarray) -> np.ndarray:
+        assert self._net is not None, "Call fit() (or load_attention()) before transform()"
+        z_src = z_src.astype(np.float32)
+        with torch.no_grad():
+            r_hat = self._net(torch.tensor(z_src)).numpy()
+        return (z_src + r_hat).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# LoRA Residual Adapter
+# ---------------------------------------------------------------------------
+
+class _LoRANet(nn.Module):
+    """
+    LoRA-style low-rank residual adapter.
+
+    Architecture:
+        A : Linear(d_input, rank, bias=False)   — Kaiming-uniform init
+        B : Linear(rank, d_output, bias=True)   — zeros init (so r_hat=0 at start)
+        r_hat = B(A(z)) * (alpha / rank)
+
+    The zero-init of B means the residual is exactly zero at the start of
+    training, so the model begins as an identity adapter.
+    """
+
+    def __init__(
+        self,
+        d_input: int,
+        d_output: int,
+        rank: int   = 32,
+        alpha: float = 32.0,
+    ):
+        super().__init__()
+        self.rank  = rank
+        self.scale = alpha / rank
+        self.A = nn.Linear(d_input, rank, bias=False)
+        self.B = nn.Linear(rank, d_output, bias=True)
+        nn.init.kaiming_uniform_(self.A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.B.weight)
+        nn.init.zeros_(self.B.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.B(self.A(x)) * self.scale
+
+
+LORA_DEFAULT_CONFIG: dict = {
+    "d_input":      192,
+    "d_output":     192,
+    "rank":         32,
+    "lora_alpha":   32.0,
+    "lr":           1e-3,
+    "weight_decay": 1e-4,
+    "epochs":       200,
+    "eval_every":   20,
+    "batch_size":   256,
+    "seed":         42,
+}
+
+
+class LoRAResidualAdapter:
+    """
+    Low-rank (LoRA-style) residual adapter trained with AdamW + CosineAnnealingLR.
+
+    Numpy-facing interface matching the other adapter classes:
+
+        adapter = LoRAResidualAdapter(...)
+        adapter.fit(z_src_tr, z_tgt_tr)
+        z_adapted = adapter.transform(z_src_val)
+    """
+
+    def __init__(
+        self,
+        rank: int           = 32,
+        lora_alpha: float   = 32.0,
+        lr: float           = 1e-3,
+        weight_decay: float = 1e-4,
+        epochs: int         = 200,
+        eval_every: int     = 20,
+        batch_size: int     = 256,
+        seed: int           = 42,
+        device: str | None  = None,
+    ):
+        self.rank         = rank
+        self.lora_alpha   = lora_alpha
+        self.lr           = lr
+        self.weight_decay = weight_decay
+        self.epochs       = epochs
+        self.eval_every   = eval_every
+        self.batch_size   = batch_size
+        self.seed         = seed
+        self._device_str  = device
+        self._net: _LoRANet | None = None
+
+    def _pick_device(self) -> torch.device:
+        if self._device_str is not None:
+            return torch.device(self._device_str)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    def fit(
+        self,
+        z_src: np.ndarray,
+        z_tgt: np.ndarray,
+        z_src_val: np.ndarray | None = None,
+        z_tgt_val: np.ndarray | None = None,
+        verbose: bool = True,
+    ) -> "LoRAResidualAdapter":
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        z_src = z_src.astype(np.float32)
+        z_tgt = z_tgt.astype(np.float32)
+        r_tr  = z_tgt - z_src
+        d_in, d_out = z_src.shape[1], r_tr.shape[1]
+        device = self._pick_device()
+
+        net = _LoRANet(d_in, d_out, rank=self.rank, alpha=self.lora_alpha)
+
+        zs_val_t = rs_val_t = None
+        if z_src_val is not None and z_tgt_val is not None:
+            zs_val_t = torch.tensor(z_src_val.astype(np.float32))
+            rs_val_t = torch.tensor((z_tgt_val - z_src_val).astype(np.float32))
+
+        self._net = _train_nn_adapter(
+            net,
+            torch.tensor(z_src), torch.tensor(r_tr),
+            epochs=self.epochs, lr=self.lr, weight_decay=self.weight_decay,
+            batch_size=self.batch_size, device=device, eval_every=self.eval_every,
+            z_src_val=zs_val_t, r_val=rs_val_t,
+            verbose=verbose, name="LoRA",
+        )
+        self._d_input  = d_in
+        self._d_output = d_out
+
+        with torch.no_grad():
+            r_hat = self._net(torch.tensor(z_src))
+            mse   = F.mse_loss(r_hat, torch.tensor(r_tr)).item()
+        print(f"    LoRAResidualAdapter: train residual MSE = {mse:.5f}")
+        return self
+
+    def transform(self, z_src: np.ndarray) -> np.ndarray:
+        assert self._net is not None, "Call fit() (or load_lora()) before transform()"
+        z_src = z_src.astype(np.float32)
+        with torch.no_grad():
+            r_hat = self._net(torch.tensor(z_src)).numpy()
+        return (z_src + r_hat).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers — MLP, Attention, LoRA
+# ---------------------------------------------------------------------------
+
+def save_mlp(
+    adapter: MLPResidualAdapter,
+    path: str | Path,
+    config: dict | None = None,
+) -> None:
+    """Save a fitted MLPResidualAdapter to *path* via torch.save."""
+    assert adapter._net is not None, "Adapter must be fitted before saving"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": adapter._net.state_dict(),
+            "d_input":    adapter._d_input,
+            "d_output":   adapter._d_output,
+            "config": {
+                "hidden":       adapter.hidden,
+                "dropout":      adapter.dropout,
+                "lr":           adapter.lr,
+                "weight_decay": adapter.weight_decay,
+                "epochs":       adapter.epochs,
+                "eval_every":   adapter.eval_every,
+                "batch_size":   adapter.batch_size,
+                "seed":         adapter.seed,
+                **(config or {}),
+            },
+        },
+        path,
+    )
+    print(f"    MLP adapter saved → {path}")
+
+
+def load_mlp(path: str | Path) -> MLPResidualAdapter:
+    """Load a MLPResidualAdapter from *path*.  Returns adapter ready for transform()."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    cfg  = ckpt.get("config") or {}
+    adapter = MLPResidualAdapter(
+        hidden       = int(  cfg.get("hidden",       MLP_DEFAULT_CONFIG["hidden"])),
+        dropout      = float(cfg.get("dropout",      MLP_DEFAULT_CONFIG["dropout"])),
+        lr           = float(cfg.get("lr",           MLP_DEFAULT_CONFIG["lr"])),
+        weight_decay = float(cfg.get("weight_decay", MLP_DEFAULT_CONFIG["weight_decay"])),
+        epochs       = int(  cfg.get("epochs",       MLP_DEFAULT_CONFIG["epochs"])),
+        eval_every   = int(  cfg.get("eval_every",   MLP_DEFAULT_CONFIG["eval_every"])),
+        batch_size   = int(  cfg.get("batch_size",   MLP_DEFAULT_CONFIG["batch_size"])),
+        seed         = int(  cfg.get("seed",         MLP_DEFAULT_CONFIG["seed"])),
+    )
+    net = _MLPNet(
+        d_input=ckpt["d_input"], d_output=ckpt["d_output"],
+        hidden=adapter.hidden, dropout=adapter.dropout,
+    )
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    adapter._net      = net
+    adapter._d_input  = ckpt["d_input"]
+    adapter._d_output = ckpt["d_output"]
+    print(f"    MLP adapter loaded ← {path}")
+    return adapter
+
+
+def save_attention(
+    adapter: AttentionResidualAdapter,
+    path: str | Path,
+    config: dict | None = None,
+) -> None:
+    """Save a fitted AttentionResidualAdapter to *path* via torch.save."""
+    assert adapter._net is not None, "Adapter must be fitted before saving"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict":     adapter._net.state_dict(),
+            "d_input":        adapter._d_input,
+            "d_output":       adapter._d_output,
+            "n_tokens":       adapter.n_tokens,
+            "token_dim":      adapter.token_dim,
+            "nhead":          adapter.nhead,
+            "n_layers":       adapter.n_layers,
+            "dim_feedforward": adapter.dim_feedforward,
+            "dropout":        adapter.dropout,
+            "config": {
+                "lr":           adapter.lr,
+                "weight_decay": adapter.weight_decay,
+                "epochs":       adapter.epochs,
+                "eval_every":   adapter.eval_every,
+                "batch_size":   adapter.batch_size,
+                "seed":         adapter.seed,
+                **(config or {}),
+            },
+        },
+        path,
+    )
+    print(f"    Attention adapter saved → {path}")
+
+
+def load_attention(path: str | Path) -> AttentionResidualAdapter:
+    """Load an AttentionResidualAdapter from *path*.  Returns adapter ready for transform()."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    cfg  = ckpt.get("config") or {}
+    adapter = AttentionResidualAdapter(
+        n_tokens       = int(  ckpt.get("n_tokens",        ATTENTION_DEFAULT_CONFIG["n_tokens"])),
+        token_dim      = int(  ckpt.get("token_dim",       ATTENTION_DEFAULT_CONFIG["token_dim"])),
+        nhead          = int(  ckpt.get("nhead",           ATTENTION_DEFAULT_CONFIG["nhead"])),
+        n_layers       = int(  ckpt.get("n_layers",        ATTENTION_DEFAULT_CONFIG["n_layers"])),
+        dim_feedforward = int( ckpt.get("dim_feedforward", ATTENTION_DEFAULT_CONFIG["dim_feedforward"])),
+        dropout        = float(ckpt.get("dropout",         ATTENTION_DEFAULT_CONFIG["dropout"])),
+        lr             = float(cfg.get("lr",               ATTENTION_DEFAULT_CONFIG["lr"])),
+        weight_decay   = float(cfg.get("weight_decay",     ATTENTION_DEFAULT_CONFIG["weight_decay"])),
+        epochs         = int(  cfg.get("epochs",           ATTENTION_DEFAULT_CONFIG["epochs"])),
+        eval_every     = int(  cfg.get("eval_every",       ATTENTION_DEFAULT_CONFIG["eval_every"])),
+        batch_size     = int(  cfg.get("batch_size",       ATTENTION_DEFAULT_CONFIG["batch_size"])),
+        seed           = int(  cfg.get("seed",             ATTENTION_DEFAULT_CONFIG["seed"])),
+    )
+    net = _AttentionNet(
+        d_input=ckpt["d_input"],
+        n_tokens=adapter.n_tokens,
+        token_dim=adapter.token_dim,
+        nhead=adapter.nhead,
+        n_layers=adapter.n_layers,
+        dim_feedforward=adapter.dim_feedforward,
+        dropout=adapter.dropout,
+    )
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    adapter._net      = net
+    adapter._d_input  = ckpt["d_input"]
+    adapter._d_output = ckpt["d_output"]
+    print(f"    Attention adapter loaded ← {path}")
+    return adapter
+
+
+def save_lora(
+    adapter: LoRAResidualAdapter,
+    path: str | Path,
+    config: dict | None = None,
+) -> None:
+    """Save a fitted LoRAResidualAdapter to *path* via torch.save."""
+    assert adapter._net is not None, "Adapter must be fitted before saving"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": adapter._net.state_dict(),
+            "d_input":    adapter._d_input,
+            "d_output":   adapter._d_output,
+            "rank":       adapter.rank,
+            "lora_alpha": adapter.lora_alpha,
+            "config": {
+                "lr":           adapter.lr,
+                "weight_decay": adapter.weight_decay,
+                "epochs":       adapter.epochs,
+                "eval_every":   adapter.eval_every,
+                "batch_size":   adapter.batch_size,
+                "seed":         adapter.seed,
+                **(config or {}),
+            },
+        },
+        path,
+    )
+    print(f"    LoRA adapter saved → {path}")
+
+
+def load_lora(path: str | Path) -> LoRAResidualAdapter:
+    """Load a LoRAResidualAdapter from *path*.  Returns adapter ready for transform()."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    cfg  = ckpt.get("config") or {}
+    adapter = LoRAResidualAdapter(
+        rank         = int(  ckpt.get("rank",       LORA_DEFAULT_CONFIG["rank"])),
+        lora_alpha   = float(ckpt.get("lora_alpha", LORA_DEFAULT_CONFIG["lora_alpha"])),
+        lr           = float(cfg.get("lr",           LORA_DEFAULT_CONFIG["lr"])),
+        weight_decay = float(cfg.get("weight_decay", LORA_DEFAULT_CONFIG["weight_decay"])),
+        epochs       = int(  cfg.get("epochs",       LORA_DEFAULT_CONFIG["epochs"])),
+        eval_every   = int(  cfg.get("eval_every",   LORA_DEFAULT_CONFIG["eval_every"])),
+        batch_size   = int(  cfg.get("batch_size",   LORA_DEFAULT_CONFIG["batch_size"])),
+        seed         = int(  cfg.get("seed",         LORA_DEFAULT_CONFIG["seed"])),
+    )
+    net = _LoRANet(
+        d_input=ckpt["d_input"], d_output=ckpt["d_output"],
+        rank=adapter.rank, alpha=adapter.lora_alpha,
+    )
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    adapter._net      = net
+    adapter._d_input  = ckpt["d_input"]
+    adapter._d_output = ckpt["d_output"]
+    print(f"    LoRA adapter loaded ← {path}")
     return adapter

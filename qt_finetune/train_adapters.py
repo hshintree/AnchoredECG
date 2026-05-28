@@ -1,7 +1,7 @@
 """
 Standalone adapter training + evaluation script for the QT fine-tuning experiment.
 
-Trains all three latent-space adapters that map the Lead-I graph_embed (192-dim)
+Trains all six latent-space adapters that map the Lead-I graph_embed (192-dim)
 to the 12-lead graph_embed (192-dim) using a residual formulation:
 
     r_i = z_12lead_i - z_lead_i
@@ -9,9 +9,12 @@ to the 12-lead graph_embed (192-dim) using a residual formulation:
 
 Adapters
 --------
-    Linear  : Ridge regression (sklearn)
-    KRR     : KernelRidge + RBF kernel + StandardScaler (sklearn)
-    GReLU   : Convex fixed-gate GReLU network trained with R-FISTA (PyTorch)
+    Linear    : Ridge regression (sklearn)
+    KRR       : KernelRidge + RBF kernel + StandardScaler (sklearn)
+    GReLU     : Convex fixed-gate GReLU network trained with R-FISTA (PyTorch)
+    MLP       : 3-layer MLP (GELU + Dropout) with AdamW + CosineAnnealingLR
+    Attention : Token-based self-attention (reshape→TransformerEncoder→project)
+    LoRA      : Low-rank adapter B(A(z))·(α/r); zero-residual initialisation
 
 Latent caching
 --------------
@@ -34,9 +37,12 @@ Each adapter is saved to qt_finetune/checkpoints/adapters/ after training.
 On subsequent runs the checkpoint is loaded and training is skipped unless
 --force-retrain is passed.
 
-    linear_adapter.pkl    — joblib pickle
-    krr_adapter.pkl       — joblib pickle
-    grelu_adapter.pt      — torch checkpoint (state_dict + config)
+    linear_adapter.pkl      — joblib pickle
+    krr_adapter.pkl         — joblib pickle
+    grelu_adapter.pt        — torch checkpoint (state_dict + config)
+    mlp_adapter.pt          — torch checkpoint (state_dict + config)
+    attention_adapter.pt    — torch checkpoint (state_dict + config)
+    lora_adapter.pt         — torch checkpoint (state_dict + config)
 
 Usage
 -----
@@ -53,10 +59,15 @@ Usage
     python qt_finetune/train_adapters.py --split test
 
     # Train only specific adapters
-    python qt_finetune/train_adapters.py --adapters linear grelu
+    python qt_finetune/train_adapters.py --adapters linear grelu mlp lora
 
     # GReLU hyper-parameters
     python qt_finetune/train_adapters.py --grelu-epochs 1000 --grelu-m 2048
+
+    # MLP / Attention / LoRA hyper-parameters
+    python qt_finetune/train_adapters.py --mlp-epochs 400 --mlp-hidden 1024
+    python qt_finetune/train_adapters.py --attn-epochs 400 --attn-n-layers 4
+    python qt_finetune/train_adapters.py --lora-rank 64 --lora-epochs 400
 
     # Pull the model checkpoint first if not already done:
     #   modal volume get ptbxl-data /best_qt_model.pt \\
@@ -86,10 +97,15 @@ from validate_qt import (
 from qt_adapter import (
     get_latents, predict_from_latents,
     LinearResidualAdapter, KernelResidualAdapter, GReLUResidualAdapter,
+    MLPResidualAdapter, AttentionResidualAdapter, LoRAResidualAdapter,
     save_linear, load_linear,
     save_krr,    load_krr,
     save_grelu,  load_grelu,
-    GRELU_DEFAULT_CONFIG,
+    save_mlp,    load_mlp,
+    save_attention, load_attention,
+    save_lora,   load_lora,
+    GRELU_DEFAULT_CONFIG, MLP_DEFAULT_CONFIG,
+    ATTENTION_DEFAULT_CONFIG, LORA_DEFAULT_CONFIG,
 )
 
 # ---------------------------------------------------------------------------
@@ -191,6 +207,113 @@ def _train_or_load_grelu(
     return adapter
 
 
+def _train_or_load_mlp(
+    zi_tr, z12_tr,
+    zi_val, z12_val,
+    ckpt_path, force,
+    hidden, dropout, lr, weight_decay, epochs, eval_every, batch_size, seed,
+    device,
+) -> MLPResidualAdapter:
+    if ckpt_path.exists() and not force:
+        print(f"  MLP: loading checkpoint ({ckpt_path.name}) …")
+        return load_mlp(ckpt_path)
+
+    has_val = (zi_val is not None) and (z12_val is not None)
+    print(
+        f"  MLP: training  hidden={hidden}  epochs={epochs}  "
+        f"lr={lr:.0e}  wd={weight_decay:.0e}  dropout={dropout}  "
+        f"batch={batch_size}  val={'yes' if has_val else 'no'}"
+    )
+    t0 = time.time()
+    adapter = MLPResidualAdapter(
+        hidden=hidden, dropout=dropout,
+        lr=lr, weight_decay=weight_decay,
+        epochs=epochs, eval_every=eval_every,
+        batch_size=batch_size, seed=seed,
+        device=str(device),
+    ).fit(
+        zi_tr, z12_tr,
+        z_src_val=zi_val if has_val else None,
+        z_tgt_val=z12_val if has_val else None,
+        verbose=True,
+    )
+    print(f"    done in {time.time()-t0:.1f}s")
+    save_mlp(adapter, ckpt_path)
+    return adapter
+
+
+def _train_or_load_attention(
+    zi_tr, z12_tr,
+    zi_val, z12_val,
+    ckpt_path, force,
+    n_tokens, token_dim, nhead, n_layers, dim_feedforward, dropout,
+    lr, weight_decay, epochs, eval_every, batch_size, seed,
+    device,
+) -> AttentionResidualAdapter:
+    if ckpt_path.exists() and not force:
+        print(f"  Attention: loading checkpoint ({ckpt_path.name}) …")
+        return load_attention(ckpt_path)
+
+    has_val = (zi_val is not None) and (z12_val is not None)
+    print(
+        f"  Attention: training  n_tokens={n_tokens}  token_dim={token_dim}  "
+        f"nhead={nhead}  n_layers={n_layers}  epochs={epochs}  "
+        f"lr={lr:.0e}  wd={weight_decay:.0e}  val={'yes' if has_val else 'no'}"
+    )
+    t0 = time.time()
+    adapter = AttentionResidualAdapter(
+        n_tokens=n_tokens, token_dim=token_dim,
+        nhead=nhead, n_layers=n_layers, dim_feedforward=dim_feedforward,
+        dropout=dropout, lr=lr, weight_decay=weight_decay,
+        epochs=epochs, eval_every=eval_every,
+        batch_size=batch_size, seed=seed,
+        device=str(device),
+    ).fit(
+        zi_tr, z12_tr,
+        z_src_val=zi_val if has_val else None,
+        z_tgt_val=z12_val if has_val else None,
+        verbose=True,
+    )
+    print(f"    done in {time.time()-t0:.1f}s")
+    save_attention(adapter, ckpt_path)
+    return adapter
+
+
+def _train_or_load_lora(
+    zi_tr, z12_tr,
+    zi_val, z12_val,
+    ckpt_path, force,
+    rank, lora_alpha, lr, weight_decay, epochs, eval_every, batch_size, seed,
+    device,
+) -> LoRAResidualAdapter:
+    if ckpt_path.exists() and not force:
+        print(f"  LoRA: loading checkpoint ({ckpt_path.name}) …")
+        return load_lora(ckpt_path)
+
+    has_val = (zi_val is not None) and (z12_val is not None)
+    print(
+        f"  LoRA: training  rank={rank}  alpha={lora_alpha}  epochs={epochs}  "
+        f"lr={lr:.0e}  wd={weight_decay:.0e}  batch={batch_size}  "
+        f"val={'yes' if has_val else 'no'}"
+    )
+    t0 = time.time()
+    adapter = LoRAResidualAdapter(
+        rank=rank, lora_alpha=lora_alpha,
+        lr=lr, weight_decay=weight_decay,
+        epochs=epochs, eval_every=eval_every,
+        batch_size=batch_size, seed=seed,
+        device=str(device),
+    ).fit(
+        zi_tr, z12_tr,
+        z_src_val=zi_val if has_val else None,
+        z_tgt_val=z12_val if has_val else None,
+        verbose=True,
+    )
+    print(f"    done in {time.time()-t0:.1f}s")
+    save_lora(adapter, ckpt_path)
+    return adapter
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -221,8 +344,9 @@ def main():
 
     # Adapter selection
     parser.add_argument("--adapters", nargs="+",
-                        choices=["linear", "krr", "grelu"], default=None,
-                        help="Subset of adapters to run (default: all three).")
+                        choices=["linear", "krr", "grelu", "mlp", "attention", "lora"],
+                        default=None,
+                        help="Subset of adapters to run (default: all six).")
 
     # Linear hyper-parameters
     parser.add_argument("--linear-alpha",  type=float, default=1.0)
@@ -242,10 +366,61 @@ def main():
     parser.add_argument("--grelu-val",        action="store_true", default=False,
                         help="Use Lead-I val latents for GReLU best-checkpoint tracking "
                              "(restores state with lowest val latent MSE).")
+    # MLP hyper-parameters
+    parser.add_argument("--mlp-hidden",       type=int,   default=MLP_DEFAULT_CONFIG["hidden"])
+    parser.add_argument("--mlp-dropout",      type=float, default=MLP_DEFAULT_CONFIG["dropout"])
+    parser.add_argument("--mlp-lr",           type=float, default=MLP_DEFAULT_CONFIG["lr"])
+    parser.add_argument("--mlp-weight-decay", type=float, default=MLP_DEFAULT_CONFIG["weight_decay"])
+    parser.add_argument("--mlp-epochs",       type=int,   default=MLP_DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--mlp-eval-every",   type=int,   default=MLP_DEFAULT_CONFIG["eval_every"])
+    parser.add_argument("--mlp-batch-size",   type=int,   default=MLP_DEFAULT_CONFIG["batch_size"])
+    parser.add_argument("--mlp-seed",         type=int,   default=MLP_DEFAULT_CONFIG["seed"])
+    parser.add_argument("--mlp-val",          action="store_true", default=False,
+                        help="Use val latents for MLP best-checkpoint tracking.")
+    # Attention hyper-parameters
+    parser.add_argument("--attn-n-tokens",        type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["n_tokens"])
+    parser.add_argument("--attn-token-dim",       type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["token_dim"])
+    parser.add_argument("--attn-nhead",           type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["nhead"])
+    parser.add_argument("--attn-n-layers",        type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["n_layers"])
+    parser.add_argument("--attn-dim-feedforward", type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["dim_feedforward"])
+    parser.add_argument("--attn-dropout",         type=float,
+                        default=ATTENTION_DEFAULT_CONFIG["dropout"])
+    parser.add_argument("--attn-lr",              type=float,
+                        default=ATTENTION_DEFAULT_CONFIG["lr"])
+    parser.add_argument("--attn-weight-decay",    type=float,
+                        default=ATTENTION_DEFAULT_CONFIG["weight_decay"])
+    parser.add_argument("--attn-epochs",          type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--attn-eval-every",      type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["eval_every"])
+    parser.add_argument("--attn-batch-size",      type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["batch_size"])
+    parser.add_argument("--attn-seed",            type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["seed"])
+    parser.add_argument("--attn-val",             action="store_true", default=False,
+                        help="Use val latents for Attention best-checkpoint tracking.")
+    # LoRA hyper-parameters
+    parser.add_argument("--lora-rank",         type=int,   default=LORA_DEFAULT_CONFIG["rank"])
+    parser.add_argument("--lora-alpha",        type=float, default=LORA_DEFAULT_CONFIG["lora_alpha"])
+    parser.add_argument("--lora-lr",           type=float, default=LORA_DEFAULT_CONFIG["lr"])
+    parser.add_argument("--lora-weight-decay", type=float, default=LORA_DEFAULT_CONFIG["weight_decay"])
+    parser.add_argument("--lora-epochs",       type=int,   default=LORA_DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--lora-eval-every",   type=int,   default=LORA_DEFAULT_CONFIG["eval_every"])
+    parser.add_argument("--lora-batch-size",   type=int,   default=LORA_DEFAULT_CONFIG["batch_size"])
+    parser.add_argument("--lora-seed",         type=int,   default=LORA_DEFAULT_CONFIG["seed"])
+    parser.add_argument("--lora-val",          action="store_true", default=False,
+                        help="Use val latents for LoRA best-checkpoint tracking.")
 
     args = parser.parse_args()
 
-    run_adapters = set(args.adapters) if args.adapters else {"linear", "krr", "grelu"}
+    run_adapters = set(args.adapters) if args.adapters else {
+        "linear", "krr", "grelu", "mlp", "attention", "lora"
+    }
 
     # ── Device ────────────────────────────────────────────────────────────
     if torch.cuda.is_available():
@@ -274,9 +449,12 @@ def main():
     latent_dir  = Path(args.latent_dir);  latent_dir.mkdir(parents=True, exist_ok=True)
     adapter_dir = Path(args.adapter_dir); adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    linear_ckpt = adapter_dir / "linear_adapter.pkl"
-    krr_ckpt    = adapter_dir / "krr_adapter.pkl"
-    grelu_ckpt  = adapter_dir / "grelu_adapter.pt"
+    linear_ckpt    = adapter_dir / "linear_adapter.pkl"
+    krr_ckpt       = adapter_dir / "krr_adapter.pkl"
+    grelu_ckpt     = adapter_dir / "grelu_adapter.pt"
+    mlp_ckpt       = adapter_dir / "mlp_adapter.pt"
+    attention_ckpt = adapter_dir / "attention_adapter.pt"
+    lora_ckpt      = adapter_dir / "lora_adapter.pt"
 
     # ── Dataset kwargs ────────────────────────────────────────────────────
     def _ds(split, leads):
@@ -309,22 +487,32 @@ def main():
         desc=f"Lead I {args.split}",
     )
 
-    # Optional: val latents for GReLU best-state tracking
-    zi_val_for_grelu  = None
-    z12_val_for_grelu = None
-    if "grelu" in run_adapters and args.grelu_val:
-        zi_val_for_grelu, _, _, _ = get_latents(
+    # Optional: val latents for best-state tracking (GReLU / MLP / Attention / LoRA)
+    _need_val_latents = (
+        ("grelu"     in run_adapters and args.grelu_val) or
+        ("mlp"       in run_adapters and args.mlp_val) or
+        ("attention" in run_adapters and args.attn_val) or
+        ("lora"      in run_adapters and args.lora_val)
+    )
+    zi_val_shared  = None
+    z12_val_shared = None
+    if _need_val_latents:
+        zi_val_shared, _, _, _ = get_latents(
             model, _ds("val", [0]), device, args.batch_size,
             cache_path=latent_dir / "val_leadI.npz",
             ckpt_mtime=ckpt_mtime, force=args.force_reextract,
             desc="Lead I val",
         )
-        z12_val_for_grelu, _, _, _ = get_latents(
+        z12_val_shared, _, _, _ = get_latents(
             model, _ds("val", list(range(12))), device, args.batch_size,
             cache_path=latent_dir / "val_12lead.npz",
             ckpt_mtime=ckpt_mtime, force=args.force_reextract,
             desc="12-lead val",
         )
+
+    # Convenience aliases (keep grelu names for backward compat)
+    zi_val_for_grelu  = zi_val_shared  if args.grelu_val else None
+    z12_val_for_grelu = z12_val_shared if args.grelu_val else None
 
     # ── Baseline ──────────────────────────────────────────────────────────
     print(f"\n── Baseline ({args.split}) ───────────────────────────────────")
@@ -363,6 +551,47 @@ def main():
             device=device,
         )
 
+    if "mlp" in run_adapters:
+        adapters["Lead I + MLP"] = _train_or_load_mlp(
+            zi_tr, z12_tr,
+            zi_val=zi_val_shared  if args.mlp_val else None,
+            z12_val=z12_val_shared if args.mlp_val else None,
+            ckpt_path=mlp_ckpt, force=args.force_retrain,
+            hidden=args.mlp_hidden, dropout=args.mlp_dropout,
+            lr=args.mlp_lr, weight_decay=args.mlp_weight_decay,
+            epochs=args.mlp_epochs, eval_every=args.mlp_eval_every,
+            batch_size=args.mlp_batch_size, seed=args.mlp_seed,
+            device=device,
+        )
+
+    if "attention" in run_adapters:
+        adapters["Lead I + Attention"] = _train_or_load_attention(
+            zi_tr, z12_tr,
+            zi_val=zi_val_shared  if args.attn_val else None,
+            z12_val=z12_val_shared if args.attn_val else None,
+            ckpt_path=attention_ckpt, force=args.force_retrain,
+            n_tokens=args.attn_n_tokens, token_dim=args.attn_token_dim,
+            nhead=args.attn_nhead, n_layers=args.attn_n_layers,
+            dim_feedforward=args.attn_dim_feedforward, dropout=args.attn_dropout,
+            lr=args.attn_lr, weight_decay=args.attn_weight_decay,
+            epochs=args.attn_epochs, eval_every=args.attn_eval_every,
+            batch_size=args.attn_batch_size, seed=args.attn_seed,
+            device=device,
+        )
+
+    if "lora" in run_adapters:
+        adapters["Lead I + LoRA"] = _train_or_load_lora(
+            zi_tr, z12_tr,
+            zi_val=zi_val_shared  if args.lora_val else None,
+            z12_val=z12_val_shared if args.lora_val else None,
+            ckpt_path=lora_ckpt, force=args.force_retrain,
+            rank=args.lora_rank, lora_alpha=args.lora_alpha,
+            lr=args.lora_lr, weight_decay=args.lora_weight_decay,
+            epochs=args.lora_epochs, eval_every=args.lora_eval_every,
+            batch_size=args.lora_batch_size, seed=args.lora_seed,
+            device=device,
+        )
+
     # ── Evaluate adapters ─────────────────────────────────────────────────
     if adapters:
         print(f"\n── Evaluation ({args.split}) ─────────────────────────────")
@@ -390,7 +619,7 @@ def main():
     for f in sorted(latent_dir.glob("*.npz")):
         print(f"  {f.name:<28}  {f.stat().st_size/1e6:.1f} MB")
     print(f"\nAdapter cache : {adapter_dir}/")
-    for p, tag in [(linear_ckpt, "linear"), (krr_ckpt, "krr"), (grelu_ckpt, "grelu")]:
+    for p in [linear_ckpt, krr_ckpt, grelu_ckpt, mlp_ckpt, attention_ckpt, lora_ckpt]:
         if p.exists():
             print(f"  {p.name:<28}  {p.stat().st_size/1e6:.1f} MB")
     print("\nDone.")
