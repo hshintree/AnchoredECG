@@ -65,10 +65,15 @@ from validate_qt import (
 from qt_adapter import (
     get_latents, predict_from_latents,
     LinearResidualAdapter, KernelResidualAdapter, GReLUResidualAdapter,
+    MLPResidualAdapter, AttentionResidualAdapter, LoRAResidualAdapter,
     save_linear, load_linear,
     save_krr,    load_krr,
     save_grelu,  load_grelu,
-    GRELU_DEFAULT_CONFIG,
+    save_mlp,    load_mlp,
+    save_attention, load_attention,
+    save_lora,   load_lora,
+    GRELU_DEFAULT_CONFIG, MLP_DEFAULT_CONFIG,
+    ATTENTION_DEFAULT_CONFIG, LORA_DEFAULT_CONFIG,
 )
 
 # ---------------------------------------------------------------------------
@@ -83,22 +88,48 @@ DEFAULT_FEATURES_DIR = _DATA / "ptb-xl-a-comprehensive-electrocardiographic-feat
 DEFAULT_OUTPUT_DIR   = _SCRIPT_DIR / "plots"
 
 PALETTE = {
-    "12-lead":           "#1565C0",   # deep blue
-    "6 limb leads":      "#2E7D32",   # deep green
-    "Lead I":            "#E65100",   # deep orange
-    "ICM (V3−V2)":       "#AD1457",   # deep pink
-    "Lead I + Linear":   "#FF8F00",   # amber  (adapter of Lead I)
-    "Lead I + KRR":      "#6A1B9A",   # deep purple
-    "Lead I + GReLU":    "#00838F",   # teal
+    "12-lead":             "#1565C0",   # deep blue
+    "6 limb leads":        "#2E7D32",   # deep green
+    "Lead I":              "#E65100",   # deep orange
+    "ICM (V3−V2)":         "#AD1457",   # deep pink
+    "Lead I + Linear":     "#FF8F00",   # amber  (adapter of Lead I)
+    "Lead I + KRR":        "#6A1B9A",   # deep purple
+    "Lead I + GReLU":      "#00838F",   # teal
+    "Lead I + MLP":        "#C62828",   # dark red
+    "Lead I + Attention":  "#37474F",   # blue-grey
+    "Lead I + LoRA":       "#558B2F",   # olive green
+    # JEPA end-to-end variants (darker / bolder shades to distinguish from frozen)
+    "Lead I + JEPA-Linear":    "#B71C1C",  # very dark red
+    "Lead I + JEPA-MLP":       "#880E4F",  # very dark pink
+    "Lead I + JEPA-Attention": "#1A237E",  # very dark blue
+    "Lead I + JEPA-LoRA":      "#1B5E20",  # very dark green
+    "Lead I + JEPA-GReLU":     "#BF360C",  # deep burnt orange
+    # JEPA lambda_QT sweep (all Linear predictor, three lambda_QT values)
+    "Lead I + JEPA-Linear (λ=0.5)": "#EF5350",  # red 400 (lighter, weaker QT loss)
+    "Lead I + JEPA-Linear (λ=1.0)": "#B71C1C",  # red 900 (baseline)
+    "Lead I + JEPA-Linear (λ=2.0)": "#4A0000",  # darkest red (strongest QT loss)
 }
 LS = {
-    "12-lead":           "-",
-    "6 limb leads":      "--",
-    "Lead I":            "-.",
-    "ICM (V3−V2)":       ":",
-    "Lead I + Linear":   (0, (3, 1, 1, 1)),   # dash-dot-dot
-    "Lead I + KRR":      (0, (5, 1)),          # densely dashed
-    "Lead I + GReLU":    (0, (1, 1)),          # densely dotted
+    "12-lead":             "-",
+    "6 limb leads":        "--",
+    "Lead I":              "-.",
+    "ICM (V3−V2)":         ":",
+    "Lead I + Linear":     (0, (3, 1, 1, 1)),        # dash-dot-dot
+    "Lead I + KRR":        (0, (5, 1)),              # densely dashed
+    "Lead I + GReLU":      (0, (1, 1)),              # densely dotted
+    "Lead I + MLP":        (0, (4, 1, 1, 1, 1, 1)), # long-dash dot-dot
+    "Lead I + Attention":  (0, (3, 2)),              # dashed, wider gap
+    "Lead I + LoRA":       (0, (2, 1, 2, 1, 1, 1)), # mixed
+    # JEPA end-to-end variants
+    "Lead I + JEPA-Linear":    (0, (6, 1, 1, 1)),    # extra-long dash dot
+    "Lead I + JEPA-MLP":       (0, (4, 2)),           # medium dashes
+    "Lead I + JEPA-Attention": (0, (2, 2, 6, 2)),     # short-short-long
+    "Lead I + JEPA-LoRA":      (0, (1, 2)),           # dotted wider gaps
+    "Lead I + JEPA-GReLU":     (0, (6, 2, 2, 2)),    # long dash wide gap dot
+    # JEPA lambda_QT sweep variants
+    "Lead I + JEPA-Linear (λ=0.5)": (0, (4, 1, 1, 1)),   # dash-dot-dot (short)
+    "Lead I + JEPA-Linear (λ=1.0)": (0, (5, 1, 1, 1)),   # dash-dot-dot (medium)
+    "Lead I + JEPA-Linear (λ=2.0)": (0, (6, 1, 1, 1)),   # dash-dot-dot (long)
 }
 
 # ---------------------------------------------------------------------------
@@ -500,6 +531,75 @@ def plot_prc_single_threshold(
 
 
 # ---------------------------------------------------------------------------
+# 5b. One-off ROC at a fixed single threshold (e.g. QTc > 450 ms)
+#     NOT run by default — pass --prc-450 to enable (paired with the PRC).
+# ---------------------------------------------------------------------------
+
+def plot_roc_single_threshold(
+    all_data: dict,
+    threshold_ms: float,
+    output_path: Path,
+) -> None:
+    """
+    ROC curves for all configs using a SINGLE universal QTc threshold.
+
+    Companion to plot_prc_single_threshold — both use the same universal
+    threshold (e.g. QTc > 450 ms) rather than the narrow/wide-QRS rule.
+    Higher prevalence (~25% at 450 ms) makes AUROC more discriminative.
+
+    Not the primary analysis — called together with --prc-450.
+    """
+    from sklearn.metrics import roc_curve as _roc_curve
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    any_plotted = False
+
+    for name, d in all_data.items():
+        v        = d["valid"]
+        ref_qtc  = d["ref_qtc"][v]
+        pred_qtc = d["pred_qtc"][v]
+
+        y_true  = (ref_qtc > threshold_ms).astype(int)
+        y_score = pred_qtc
+
+        n_pos = int(y_true.sum())
+        n     = int(v.sum())
+        prev  = n_pos / n
+
+        if n_pos < 5:
+            print(f"  {name}: only {n_pos} positives at QTc>{threshold_ms:.0f} — skipping")
+            continue
+
+        auc         = roc_auc_score(y_true, y_score)
+        fpr, tpr, _ = _roc_curve(y_true, y_score)
+
+        ax.plot(fpr, tpr,
+                color=PALETTE.get(name, "#555"), lw=2.5, ls=LS.get(name, "-"),
+                label=f"{name}   AUC={auc:.3f}  (n+={n_pos}, {prev:.1%})")
+        print(f"  {name:<22}  QTc>{threshold_ms:.0f}ms  n+={n_pos}  prev={prev:.1%}  AUROC={auc:.4f}")
+        any_plotted = True
+
+    ax.plot([0, 1], [0, 1], "--", color="#aaa", lw=1.2,
+            label="No-skill baseline (AUC = 0.50)")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
+    ax.set_xlabel("False Positive Rate (1 − Specificity)", fontsize=13)
+    ax.set_ylabel("True Positive Rate (Sensitivity)",      fontsize=13)
+    ax.set_title(
+        f"ROC Curve — QTc > {threshold_ms:.0f} ms (Bazett, universal threshold)\n"
+        "One-off analysis · NOT the primary narrow/wide-QRS threshold",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=9.5, loc="lower right", framealpha=0.92)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ROC (QTc>{threshold_ms:.0f}ms) → {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # 6. Combined Pearson QTc  — all configs overlaid in one plot
 # ---------------------------------------------------------------------------
 
@@ -561,7 +661,7 @@ def plot_pearson_combined(all_data: dict, output_path: Path,
     ax.set_ylabel("Predicted QTc [ms]", fontsize=13)
     ax.set_title(
         f"Combined Pearson Correlation: Predicted QTc vs Reference QTc\n"
-        f"Split = {split}  (PTB-XL, waveform-only model, 500 Hz)",
+        f"Split = {split}  (PTB-XL, 500 Hz)  |  JEPA variants: Lead I only at inference",
         fontsize=12, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="lower right", framealpha=0.93,
@@ -615,7 +715,7 @@ def plot_roc_curves(all_data: dict, output_path: Path,
     ax.set_title(
         "ROC Curves — QTc Prolongation\n"
         "Narrow QRS (≤100 ms) → QTc > 500 ms  |  Wide QRS (>100 ms) → QTc > 550 ms\n"
-        f"Split = {split}",
+        f"Split = {split}  |  JEPA variants: Lead I only at inference",
         fontsize=11, fontweight="bold",
     )
     ax.legend(fontsize=9.5, loc="lower right", framealpha=0.92)
@@ -674,7 +774,7 @@ def plot_prc_curves(all_data: dict, output_path: Path,
     ax.set_title(
         "Precision-Recall Curves — QTc Prolongation\n"
         "Narrow QRS (≤100 ms) → QTc > 500 ms  |  Wide QRS (>100 ms) → QTc > 550 ms\n"
-        f"Split = {split}",
+        f"Split = {split}  |  JEPA variants: Lead I only at inference",
         fontsize=11, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="upper right", framealpha=0.92)
@@ -750,6 +850,50 @@ def main():
     parser.add_argument("--grelu-lambda-l1",  type=float,
                         default=GRELU_DEFAULT_CONFIG["lambda_l1"],
                         help="L1 penalty on feature weights (0 = off).")
+    # MLP adapter
+    parser.add_argument("--mlp-hidden",       type=int,   default=MLP_DEFAULT_CONFIG["hidden"])
+    parser.add_argument("--mlp-dropout",      type=float, default=MLP_DEFAULT_CONFIG["dropout"])
+    parser.add_argument("--mlp-epochs",       type=int,   default=MLP_DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--mlp-eval-every",   type=int,   default=MLP_DEFAULT_CONFIG["eval_every"])
+    parser.add_argument("--mlp-lr",           type=float, default=MLP_DEFAULT_CONFIG["lr"])
+    parser.add_argument("--mlp-weight-decay", type=float, default=MLP_DEFAULT_CONFIG["weight_decay"])
+    parser.add_argument("--mlp-batch-size",   type=int,   default=MLP_DEFAULT_CONFIG["batch_size"])
+    # Attention adapter
+    parser.add_argument("--attn-n-tokens",       type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["n_tokens"])
+    parser.add_argument("--attn-token-dim",      type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["token_dim"])
+    parser.add_argument("--attn-nhead",          type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["nhead"])
+    parser.add_argument("--attn-n-layers",       type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["n_layers"])
+    parser.add_argument("--attn-dim-feedforward", type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["dim_feedforward"])
+    parser.add_argument("--attn-dropout",        type=float,
+                        default=ATTENTION_DEFAULT_CONFIG["dropout"])
+    parser.add_argument("--attn-epochs",         type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--attn-eval-every",     type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["eval_every"])
+    parser.add_argument("--attn-lr",             type=float,
+                        default=ATTENTION_DEFAULT_CONFIG["lr"])
+    parser.add_argument("--attn-weight-decay",   type=float,
+                        default=ATTENTION_DEFAULT_CONFIG["weight_decay"])
+    parser.add_argument("--attn-batch-size",     type=int,
+                        default=ATTENTION_DEFAULT_CONFIG["batch_size"])
+    # LoRA adapter
+    parser.add_argument("--lora-rank",         type=int,   default=LORA_DEFAULT_CONFIG["rank"])
+    parser.add_argument("--lora-alpha",        type=float, default=LORA_DEFAULT_CONFIG["lora_alpha"])
+    parser.add_argument("--lora-epochs",       type=int,   default=LORA_DEFAULT_CONFIG["epochs"])
+    parser.add_argument("--lora-eval-every",   type=int,   default=LORA_DEFAULT_CONFIG["eval_every"])
+    parser.add_argument("--lora-lr",           type=float, default=LORA_DEFAULT_CONFIG["lr"])
+    parser.add_argument("--lora-weight-decay", type=float, default=LORA_DEFAULT_CONFIG["weight_decay"])
+    parser.add_argument("--lora-batch-size",   type=int,   default=LORA_DEFAULT_CONFIG["batch_size"])
+    # JEPA end-to-end
+    parser.add_argument("--jepa-dir", default=None,
+                        help="Directory containing jepa_*.pt checkpoints "
+                             "(default: qt_finetune/checkpoints/jepa/).  "
+                             "Any checkpoint found there is loaded automatically.")
     args = parser.parse_args()
 
     # ── Checkpoint guard ──────────────────────────────────────────────────
@@ -819,17 +963,23 @@ def main():
                    else _SCRIPT_DIR / "checkpoints" / "adapters")
     _latent_dir = (Path(args.adapter_latent_dir) if args.adapter_latent_dir
                    else _SCRIPT_DIR / "checkpoints" / "latents")
-    _linear_ckpt = _ckpt_dir / "linear_adapter.pkl"
-    _krr_ckpt    = _ckpt_dir / "krr_adapter.pkl"
-    _grelu_ckpt  = _ckpt_dir / "grelu_adapter.pt"
+    _linear_ckpt    = _ckpt_dir / "linear_adapter.pkl"
+    _krr_ckpt       = _ckpt_dir / "krr_adapter.pkl"
+    _grelu_ckpt     = _ckpt_dir / "grelu_adapter.pt"
+    _mlp_ckpt       = _ckpt_dir / "mlp_adapter.pt"
+    _attention_ckpt = _ckpt_dir / "attention_adapter.pt"
+    _lora_ckpt      = _ckpt_dir / "lora_adapter.pt"
     _force_ada   = args.adapter_force_retrain
     _force_lat   = args.force_reextract
 
     # Which adapters exist on disk right now?
     _cached = {
-        "Lead I + Linear": _linear_ckpt.exists() and not _force_ada,
-        "Lead I + KRR":    _krr_ckpt.exists()    and not _force_ada,
-        "Lead I + GReLU":  _grelu_ckpt.exists()  and not _force_ada,
+        "Lead I + Linear":    _linear_ckpt.exists()    and not _force_ada,
+        "Lead I + KRR":       _krr_ckpt.exists()       and not _force_ada,
+        "Lead I + GReLU":     _grelu_ckpt.exists()     and not _force_ada,
+        "Lead I + MLP":       _mlp_ckpt.exists()       and not _force_ada,
+        "Lead I + Attention": _attention_ckpt.exists() and not _force_ada,
+        "Lead I + LoRA":      _lora_ckpt.exists()      and not _force_ada,
     }
     _any_cached   = any(_cached.values())
     _need_to_train = args.adapters  # only train when explicitly requested
@@ -926,11 +1076,78 @@ def main():
                 return a
             return None
 
+        def _resolve_mlp():
+            if _cached["Lead I + MLP"]:
+                return load_mlp(_mlp_ckpt)
+            if _need_to_train:
+                print(
+                    f"  MLP: training  hidden={args.mlp_hidden}  "
+                    f"epochs={args.mlp_epochs}  lr={args.mlp_lr:.0e}  "
+                    f"wd={args.mlp_weight_decay:.0e}  dropout={args.mlp_dropout}"
+                )
+                a = MLPResidualAdapter(
+                    hidden=args.mlp_hidden, dropout=args.mlp_dropout,
+                    lr=args.mlp_lr, weight_decay=args.mlp_weight_decay,
+                    epochs=args.mlp_epochs, eval_every=args.mlp_eval_every,
+                    batch_size=args.mlp_batch_size,
+                    device=str(device),
+                ).fit(zi_tr, z12_tr, verbose=True)
+                save_mlp(a, _mlp_ckpt)
+                return a
+            return None
+
+        def _resolve_attention():
+            if _cached["Lead I + Attention"]:
+                return load_attention(_attention_ckpt)
+            if _need_to_train:
+                print(
+                    f"  Attention: training  n_tokens={args.attn_n_tokens}  "
+                    f"token_dim={args.attn_token_dim}  nhead={args.attn_nhead}  "
+                    f"n_layers={args.attn_n_layers}  epochs={args.attn_epochs}  "
+                    f"lr={args.attn_lr:.0e}"
+                )
+                a = AttentionResidualAdapter(
+                    n_tokens=args.attn_n_tokens, token_dim=args.attn_token_dim,
+                    nhead=args.attn_nhead, n_layers=args.attn_n_layers,
+                    dim_feedforward=args.attn_dim_feedforward,
+                    dropout=args.attn_dropout,
+                    lr=args.attn_lr, weight_decay=args.attn_weight_decay,
+                    epochs=args.attn_epochs, eval_every=args.attn_eval_every,
+                    batch_size=args.attn_batch_size,
+                    device=str(device),
+                ).fit(zi_tr, z12_tr, verbose=True)
+                save_attention(a, _attention_ckpt)
+                return a
+            return None
+
+        def _resolve_lora():
+            if _cached["Lead I + LoRA"]:
+                return load_lora(_lora_ckpt)
+            if _need_to_train:
+                print(
+                    f"  LoRA: training  rank={args.lora_rank}  "
+                    f"alpha={args.lora_alpha}  epochs={args.lora_epochs}  "
+                    f"lr={args.lora_lr:.0e}  wd={args.lora_weight_decay:.0e}"
+                )
+                a = LoRAResidualAdapter(
+                    rank=args.lora_rank, lora_alpha=args.lora_alpha,
+                    lr=args.lora_lr, weight_decay=args.lora_weight_decay,
+                    epochs=args.lora_epochs, eval_every=args.lora_eval_every,
+                    batch_size=args.lora_batch_size,
+                    device=str(device),
+                ).fit(zi_tr, z12_tr, verbose=True)
+                save_lora(a, _lora_ckpt)
+                return a
+            return None
+
         # ── Apply each resolved adapter ───────────────────────────────────
         for aname, resolver in [
-            ("Lead I + Linear", _resolve_linear),
-            ("Lead I + KRR",    _resolve_krr),
-            ("Lead I + GReLU",  _resolve_grelu),
+            ("Lead I + Linear",    _resolve_linear),
+            ("Lead I + KRR",       _resolve_krr),
+            ("Lead I + GReLU",     _resolve_grelu),
+            ("Lead I + MLP",       _resolve_mlp),
+            ("Lead I + Attention", _resolve_attention),
+            ("Lead I + LoRA",      _resolve_lora),
         ]:
             adapter = resolver()
             if adapter is None:
@@ -942,6 +1159,60 @@ def main():
             r           = float(np.corrcoef(pred_qt_ada, tgt_qt_val)[0, 1])
             print(f"  {aname}: MAE={np.abs(err).mean():.2f} ms  R={r:.3f}")
             all_data[aname] = d_ada
+
+    # ── JEPA end-to-end adapters ──────────────────────────────────────────
+    # Auto-detect: load any jepa_*.pt checkpoint found under --jepa-dir (or the
+    # default location).  No flag needed — checkpoints are included automatically
+    # when they exist on disk.
+    _jepa_dir = (
+        Path(args.jepa_dir) if args.jepa_dir
+        else _SCRIPT_DIR / "checkpoints" / "jepa"
+    )
+    # Map from checkpoint stem (after "jepa_") → display label in plots
+    _jepa_name_map = {
+        "linear":         "Lead I + JEPA-Linear",
+        "mlp":            "Lead I + JEPA-MLP",
+        "attention":      "Lead I + JEPA-Attention",
+        "lora":           "Lead I + JEPA-LoRA",
+        "grelu":          "Lead I + JEPA-GReLU",
+        # lambda_QT sweep variants (Linear predictor, three lambda values)
+        "linear_lqt0.5":  "Lead I + JEPA-Linear (λ=0.5)",
+        "linear_lqt1.0":  "Lead I + JEPA-Linear (λ=1.0)",
+        "linear_lqt2.0":  "Lead I + JEPA-Linear (λ=2.0)",
+    }
+    # Scan all non-resume jepa_*.pt files under _jepa_dir
+    _jepa_found = {}   # display_label → path
+    if _jepa_dir.exists():
+        for _jf in sorted(_jepa_dir.glob("jepa_*.pt")):
+            if _jf.stem.endswith("_resume"):
+                continue
+            _stem = _jf.stem[len("jepa_"):]   # strip "jepa_" prefix
+            if _stem in _jepa_name_map:
+                _jepa_found[_jepa_name_map[_stem]] = _jf
+            else:
+                print(f"  (JEPA checkpoint with unknown stem '{_stem}' — skipping)")
+
+    if _jepa_found:
+        from train_jepa import load_jepa_inference_model   # lazy import, no circular dep
+
+        # Inference uses Lead I only (context branch) — no 12-lead needed at test time
+        _leadI_ds = ForcedLeadDataset(lead_indices=[0], **ds_kwargs)
+
+        print(f"\n── JEPA End-to-End Adapters ─────────────────────────────────")
+        print(f"  ℹ  JEPA inference uses Lead I only (context branch) — no 12-lead ECG needed.")
+        for label, jpath in _jepa_found.items():
+            print(f"  {label} ...", end=" ", flush=True)
+            jepa_model = load_jepa_inference_model(jpath, device)
+            pred_qt_j, tgt_qt_j, ecg_ids_j = run_inference(
+                jepa_model, _leadI_ds, device, args.batch_size
+            )
+            d_jepa = add_qtc(pred_qt_j, tgt_qt_j, ecg_ids_j, meta)
+            err_j  = pred_qt_j - tgt_qt_j
+            r_j    = float(np.corrcoef(pred_qt_j, tgt_qt_j)[0, 1])
+            print(f"MAE={np.abs(err_j).mean():.2f} ms  R={r_j:.3f}")
+            all_data[label] = d_jepa
+    elif _jepa_dir.exists():
+        print(f"\n  (No JEPA checkpoints found in {_jepa_dir}/ — run train_jepa.py first)")
 
     # ── Sample calculation table (12-lead only, clearest diagnostic) ──────
     print("\n── Sample Calculation Table (12-lead) ───────────────────────")
@@ -976,13 +1247,18 @@ def main():
         split=sp,
     )
 
-    # ── 450 ms ablation PRC (opt-in only) ────────────────────────────────
+    # ── 450 ms ablation PRC + ROC (opt-in only) ──────────────────────────
     if args.prc_450:
-        print("\n── PRC ablation: QTc > 450 ms (universal threshold) ──────────")
+        print("\n── 450 ms ablation: QTc > 450 ms (universal threshold) ───────")
         plot_prc_single_threshold(
             all_data,
             threshold_ms=450.0,
             output_path=out / f"qtc_prc_450ms_{sp}.png",
+        )
+        plot_roc_single_threshold(
+            all_data,
+            threshold_ms=450.0,
+            output_path=out / f"qtc_roc_450ms_{sp}.png",
         )
 
     print(f"\nOutputs ({out}/):")
