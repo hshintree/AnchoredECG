@@ -82,7 +82,7 @@ def _get_deployed_train_fn():
 
 @app.function(
     image=training_image,
-    gpu="A10G",
+    gpu="A100",
     volumes={"/ptbxl": ptbxl_vol},
     secrets=[modal.Secret.from_name("wandb")],
     timeout=8 * 3600,
@@ -92,8 +92,8 @@ def _get_deployed_train_fn():
 )
 def train_jepa_fn(
     predictor_name: str,
-    warmup_epochs:   int   = 50,
-    finetune_epochs: int   = 150,
+    warmup_epochs:   int   = 20,
+    finetune_epochs: int   = 80,
     eval_every:      int   = 10,
     lambda_jepa:     float = 1.0,
     lambda_qt:       float = 1.0,
@@ -368,13 +368,135 @@ def train_grelu():
 
 @app.local_entrypoint()
 def train_all():
-    """Train all 5 JEPA backbones in parallel.  modal run modal_jepa.py::train_all"""
+    """Train all 5 original JEPA backbones in parallel.  modal run modal_jepa.py::train_all"""
     deployed  = _get_deployed_train_fn()
     predictors = ["linear", "mlp", "attention", "lora", "grelu"]
     for pname in predictors:
         deployed.spawn(predictor_name=pname)
         print(f"  Spawned JEPA-{pname.upper()}")
     print(f"\n{len(predictors)} jobs running in parallel. Safe to close terminal.")
+    print("Download: modal run modal_jepa.py::download_checkpoints")
+
+
+@app.local_entrypoint()
+def respawn_cgrelu_original():
+    """Resume the cgrelu (m=1024) run from its Phase-2 resume checkpoint.
+
+    The run was stopped at finetune epoch 35/120 with a resume checkpoint on
+    the volume.  train_jepa_fn detects phase=finetune in the resume file and
+    skips warmup entirely, picking up from epoch 36 → 120.
+
+    modal deploy modal_jepa.py
+    modal run modal_jepa.py::respawn_cgrelu_original
+    """
+    _get_deployed_train_fn().spawn(
+        predictor_name="cgrelu",
+        warmup_epochs=50,
+        finetune_epochs=120,
+    )
+    print("JEPA-CvxGReLU (m=1024) respawned — will resume from finetune epoch 36.")
+    print("Download: modal volume get ptbxl-data /jepa/jepa_cgrelu.pt "
+          "qt_finetune/checkpoints/jepa/jepa_cgrelu.pt")
+
+
+@app.local_entrypoint()
+def train_rwna():
+    """Train JEPA-RWNA (k=16, nonlinear rank-16 predictor).
+
+    Tests whether a nonlinear rank-16 bottleneck breaks the rank-2 collapse
+    observed in JEPA-Linear (where linear rank-2 gradients kept z_c degenerate).
+
+    modal deploy modal_jepa.py
+    modal run modal_jepa.py::train_rwna
+    """
+    _get_deployed_train_fn().spawn(
+        predictor_name="rwna",
+        warmup_epochs=20,
+        finetune_epochs=80,
+    )
+    print("JEPA-RWNA (k=16) spawned. Safe to close terminal.")
+    print("Download: modal volume get ptbxl-data /jepa/jepa_rwna.pt "
+          "qt_finetune/checkpoints/jepa/jepa_rwna.pt")
+
+
+@app.local_entrypoint()
+def train_lora16():
+    """Train JEPA-LoRA16 (rank=16, linear ablation partner to RWNA).
+
+    Same rank-16 bottleneck as RWNA but linear — isolates whether the
+    nonlinearity inside the k-dim space is what matters, vs the rank alone.
+
+    modal deploy modal_jepa.py
+    modal run modal_jepa.py::train_lora16
+    """
+    _get_deployed_train_fn().spawn(
+        predictor_name="lora16",
+        warmup_epochs=20,
+        finetune_epochs=80,
+    )
+    print("JEPA-LoRA16 (rank=16) spawned. Safe to close terminal.")
+    print("Download: modal volume get ptbxl-data /jepa/jepa_lora16.pt "
+          "qt_finetune/checkpoints/jepa/jepa_lora16.pt")
+
+
+@app.local_entrypoint()
+def train_cgrelu():
+    """Train JEPA-CvxGReLU-512 and JEPA-CvxGReLU-256 in parallel.
+
+    Both use the same convex-GReLU training constraints (vs plain JEPA-GReLU):
+      1. proj.weight clamped >= 0 after every optimizer step — guarantees the
+         network is a convex function of z_c (non-negative output weights over
+         ReLU-gated features).
+      2. L1 penalty (1e-4) on linear1.weight added to the loss — sparsity prior
+         that mimics R-FISTA's proximal soft-threshold in the frozen adapter.
+
+    Neuron-count ablation:
+      cgrelu512  →  m=512  (~197K trainable params)
+      cgrelu256  →  m=256  (~98K  trainable params)
+
+    Epoch schedule: warmup=50 + finetune=120 = 170 total.
+    More than the 100 used for RWNA/LoRA16; the convex projection + L1 constraint
+    slow early convergence and benefit from a longer search.
+
+    modal deploy modal_jepa.py
+    modal run modal_jepa.py::train_cgrelu
+    """
+    deployed = _get_deployed_train_fn()
+    for pname in ["cgrelu512", "cgrelu256"]:
+        deployed.spawn(
+            predictor_name=pname,
+            warmup_epochs=50,
+            finetune_epochs=120,
+        )
+        print(f"  Spawned JEPA-{pname.upper()}")
+    print("\n2 CvxGReLU jobs running in parallel on A100. Safe to close terminal.")
+    print("Download when done:")
+    print("  modal volume get ptbxl-data /jepa/jepa_cgrelu512.pt "
+          "qt_finetune/checkpoints/jepa/jepa_cgrelu512.pt")
+    print("  modal volume get ptbxl-data /jepa/jepa_cgrelu256.pt "
+          "qt_finetune/checkpoints/jepa/jepa_cgrelu256.pt")
+
+
+@app.local_entrypoint()
+def train_rank16_ablation():
+    """Train JEPA-RWNA and JEPA-LoRA16 in parallel (the rank-16 ablation pair).
+
+    Together these answer: at the same bottleneck rank (16), does nonlinearity help?
+    Both use warmup=20, finetune=80 (reduced from 50+150 based on convergence analysis).
+
+    modal deploy modal_jepa.py
+    modal run modal_jepa.py::train_rank16_ablation
+    """
+    deployed = _get_deployed_train_fn()
+    for pname in ["rwna", "lora16"]:
+        deployed.spawn(
+            predictor_name=pname,
+            warmup_epochs=20,
+            finetune_epochs=80,
+        )
+        print(f"  Spawned JEPA-{pname.upper()}")
+    print("\n2 jobs running in parallel. Safe to close terminal.")
+    print("Monitor: modal app list  →  modal container list")
     print("Download: modal run modal_jepa.py::download_checkpoints")
 
 

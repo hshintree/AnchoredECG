@@ -710,6 +710,344 @@ def analysis_pca_embeddings(df: pd.DataFrame, out_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PCA: decomposed W vs b contributions
+# ---------------------------------------------------------------------------
+
+def analysis_pca_decomposed(
+    df: pd.DataFrame, W: np.ndarray, b: np.ndarray, out_dir: Path
+) -> None:
+    """
+    Split the adapter's action into two steps and show each in a shared PCA space.
+
+    The residual adapter computes:
+        ẑ = z_c + W·z_c + b
+
+    We trace three transformations:
+        Step 0: z_c              (Lead-I before any adapter)
+        Step 1: z_c + W·z_c     (after the LINEAR MAP, before bias)
+        Step 2: z_c + W·z_c + b (= ẑ, full output)
+        Ref  : z_12              (12-lead target — what we want to reach)
+
+    This isolates:
+        W contribution  — how much does W scatter / rotate the z_c cluster?
+        b contribution  — how much does b translate everything as a rigid shift?
+
+    Linear algebra note
+    -------------------
+    PC1 / PC2 are the eigenvectors of the covariance matrix of the joint dataset
+    (z_c ∪ ẑ ∪ z_12 ∪ z_Wc), equivalently the first two RIGHT singular vectors
+    of the centered data matrix X̄ ∈ ℝ^(4N×192).  This is a DIFFERENT SVD from
+    the one run on W: SVD(W) describes what directions the WEIGHT MATRIX reads
+    from and writes to; PCA(data) describes what directions the actual SAMPLE
+    CLOUD varies in.  The two decompositions are generally unrelated.
+
+    Produces:
+        pca_decomposed_stages.png  — 4-panel side-by-side progression
+        pca_decomposed_arrows.png  — 2-panel W arrows + b arrows with vector b shown
+    """
+    from sklearn.decomposition import PCA
+
+    print("\n" + "═"*70)
+    print("  Adapter Decomposition: W·z_c step  vs  b step  (PCA space)")
+    print("═"*70)
+
+    mask  = df["valid"].values
+    z_c   = np.stack(df.loc[mask, "z_c"].values)     # (N, 192)
+    z_hat = np.stack(df.loc[mask, "z_hat"].values)   # (N, 192)
+    z_12  = np.stack(df.loc[mask, "z_12"].values)    # (N, 192)
+    N     = len(z_c)
+
+    # Intermediate embedding: z_c + W·z_c  (before bias is added)
+    Wzc   = z_c @ W.T                               # (N, 192)  — the linear correction
+    z_Wc  = z_c + Wzc                               # (N, 192)  — after W, before b
+
+    # Norms
+    norm_Wzc  = float(np.linalg.norm(Wzc, axis=1).mean())
+    norm_b    = float(np.linalg.norm(b))
+    norm_corr = float(np.linalg.norm(z_hat - z_c, axis=1).mean())
+
+    print(f"  mean ||W·z_c||     : {norm_Wzc:.4f}  (per-sample, varies with z_c)")
+    print(f"  ||b||              : {norm_b:.4f}  (CONSTANT — same for every sample)")
+    print(f"  mean ||W·z_c + b|| : {norm_corr:.4f}  (full per-sample correction)")
+    frac_b = norm_b / (norm_b + norm_Wzc) * 100
+    print(f"  b share of L2 budget: {frac_b:.1f}%  —  "
+          f"{'b dominates' if frac_b > 60 else 'W dominates' if frac_b < 40 else 'roughly equal'}")
+
+    # Fit PCA on union of all four point clouds simultaneously so every panel
+    # shares the same 2D coordinate system.
+    all_z  = np.concatenate([z_c, z_Wc, z_hat, z_12], axis=0)
+    pca    = PCA(n_components=2, random_state=42)
+    all_2d = pca.fit_transform(all_z)
+    zc_2d   = all_2d[0*N:1*N]
+    zWc_2d  = all_2d[1*N:2*N]
+    zh_2d   = all_2d[2*N:3*N]
+    z12_2d  = all_2d[3*N:4*N]
+    var1, var2 = pca.explained_variance_ratio_ * 100
+    print(f"\n  PCA variance explained: PC1={var1:.1f}%  PC2={var2:.1f}%")
+
+    # Project b (a single 192-d vector) into PCA space.
+    # pca.transform expects (n_samples, 192); we subtract pca.mean_ first.
+    b_centered = b - pca.mean_
+    b_2d = pca.components_ @ b_centered       # (2,) — b's direction in the plot
+
+    print(f"  b projected to PCA: PC1={b_2d[0]:+.3f}  PC2={b_2d[1]:+.3f}")
+    print(f"  → b points {'mostly along PC2' if abs(b_2d[1]) > abs(b_2d[0]) else 'mostly along PC1'} "
+          f"({abs(b_2d[1])/(abs(b_2d[0])+abs(b_2d[1]))*100:.0f}% of its 2D mass on PC2)")
+
+    rng = np.random.RandomState(0)
+    idx_bg  = rng.choice(N, min(800, N), replace=False)
+    idx_arr = rng.choice(N, min(100, N), replace=False)
+
+    COLORS = {
+        "z_c":  "#E65100",  # deep orange
+        "z_Wc": "#7B1FA2",  # purple
+        "zh":   "#2E7D32",  # deep green
+        "z12":  "#1565C0",  # deep blue
+    }
+
+    # ─── Figure 1: four-panel side-by-side progression ───────────────────────
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5.5), sharex=True, sharey=True)
+    XLBL = f"PC1 ({var1:.1f}%)"
+    YLBL = f"PC2 ({var2:.1f}%)"
+
+    stage_data = [
+        (zc_2d,   COLORS["z_c"],  "Stage 1 — z_c\n(Lead-I, before adapter)"),
+        (zWc_2d,  COLORS["z_Wc"], "Stage 2 — z_c + W·z_c\n(after linear map, before bias)"),
+        (zh_2d,   COLORS["zh"],   "Stage 3 — ẑ = z_c + W·z_c + b\n(full adapter output)"),
+        (z12_2d,  COLORS["z12"],  "Stage 4 — z_12\n(12-lead target — what we aim for)"),
+    ]
+    for ax, (pts, col, title) in zip(axes, stage_data):
+        # Faint reference: z_12 target in every panel
+        ax.scatter(z12_2d[idx_bg, 0], z12_2d[idx_bg, 1],
+                   s=4, alpha=0.08, color=COLORS["z12"], linewidths=0, zorder=1)
+        # Faint reference: z_c source in every non-z_c panel
+        if pts is not zc_2d:
+            ax.scatter(zc_2d[idx_bg, 0], zc_2d[idx_bg, 1],
+                       s=4, alpha=0.08, color=COLORS["z_c"], linewidths=0, zorder=1)
+        # Main cloud
+        ax.scatter(pts[idx_bg, 0], pts[idx_bg, 1],
+                   s=10, alpha=0.55, color=col, linewidths=0, zorder=3)
+        ax.set_title(title, fontsize=9.5, fontweight="bold", color=col, pad=6)
+        ax.set_xlabel(XLBL, fontsize=10)
+        ax.grid(True, alpha=0.2)
+
+    axes[0].set_ylabel(YLBL, fontsize=10)
+    fig.suptitle(
+        "Adapter Decomposition in PCA Space: Step-by-Step Effect of W and b\n"
+        f"Gray ghost in each panel: z_12 target (blue) and z_c source (orange)\n"
+        f"||W||_F={np.linalg.norm(W,'fro'):.2f}   mean||W·z_c||={norm_Wzc:.2f}   "
+        f"||b||={norm_b:.2f}   b share={frac_b:.0f}%",
+        fontsize=10.5, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.88])
+    _save(fig, out_dir / "pca_decomposed_stages.png")
+    print(f"  Stage decomposition → {out_dir}/pca_decomposed_stages.png")
+
+    # ─── Figure 2: two panels with arrows (W step | b step) ──────────────────
+    fig2, axes2 = plt.subplots(1, 2, figsize=(16, 6.5))
+
+    # — Left panel: W effect  z_c → z_c + W·z_c ——————————————————————————
+    ax = axes2[0]
+    ax.scatter(z12_2d[idx_bg, 0], z12_2d[idx_bg, 1],
+               s=4, alpha=0.10, color=COLORS["z12"], linewidths=0, label="z_12 (target)", zorder=1)
+    ax.scatter(zc_2d[idx_bg, 0], zc_2d[idx_bg, 1],
+               s=9, alpha=0.40, color=COLORS["z_c"], linewidths=0,
+               label=f"z_c  (before W)", zorder=3)
+    ax.scatter(zWc_2d[idx_bg, 0], zWc_2d[idx_bg, 1],
+               s=9, alpha=0.40, color=COLORS["z_Wc"], linewidths=0,
+               label=f"z_c + W·z_c  (after W)", zorder=3)
+    for i in idx_arr:
+        ax.annotate("", xy=zWc_2d[i], xytext=zc_2d[i],
+                    arrowprops=dict(arrowstyle="->", color=COLORS["z_Wc"],
+                                   lw=0.7, alpha=0.30))
+    ax.set_xlabel(XLBL, fontsize=11)
+    ax.set_ylabel(YLBL, fontsize=11)
+    ax.set_title(
+        f"W contribution:  z_c  →  z_c + W·z_c\n"
+        f"||W||_F = {np.linalg.norm(W,'fro'):.3f}   "
+        f"mean||W·z_c|| = {norm_Wzc:.3f}  per sample",
+        fontsize=10, fontweight="bold",
+    )
+    ax.legend(fontsize=9, markerscale=2)
+    ax.grid(True, alpha=0.2)
+
+    # — Right panel: b effect  z_Wc → ẑ = z_Wc + b —————————————————————————
+    ax2 = axes2[1]
+    ax2.scatter(z12_2d[idx_bg, 0], z12_2d[idx_bg, 1],
+                s=4, alpha=0.10, color=COLORS["z12"], linewidths=0, label="z_12 (target)", zorder=1)
+    ax2.scatter(zWc_2d[idx_bg, 0], zWc_2d[idx_bg, 1],
+                s=9, alpha=0.40, color=COLORS["z_Wc"], linewidths=0,
+                label="z_c + W·z_c  (before b)", zorder=3)
+    ax2.scatter(zh_2d[idx_bg, 0], zh_2d[idx_bg, 1],
+                s=9, alpha=0.40, color=COLORS["zh"], linewidths=0,
+                label="ẑ = (z_c + W·z_c) + b  (after b)", zorder=3)
+    for i in idx_arr:
+        ax2.annotate("", xy=zh_2d[i], xytext=zWc_2d[i],
+                     arrowprops=dict(arrowstyle="->", color=COLORS["zh"],
+                                     lw=0.7, alpha=0.30))
+    # Draw b as a vector from the centroid of z_Wc to show its direction + magnitude
+    zWc_mean = zWc_2d.mean(axis=0)
+    ax2.annotate(
+        "", xy=zWc_mean + b_2d, xytext=zWc_mean,
+        arrowprops=dict(arrowstyle="-|>", color="#B71C1C", lw=2.5),
+        zorder=5,
+    )
+    ax2.text(
+        zWc_mean[0] + b_2d[0] * 1.04,
+        zWc_mean[1] + b_2d[1] * 1.04,
+        f"b  (||b||={norm_b:.2f})",
+        color="#B71C1C", fontsize=9.5, fontweight="bold", zorder=5,
+    )
+    ax2.set_xlabel(XLBL, fontsize=11)
+    ax2.set_ylabel(YLBL, fontsize=11)
+    ax2.set_title(
+        f"b contribution:  z_c + W·z_c  →  ẑ = + b\n"
+        f"||b|| = {norm_b:.3f}   "
+        f"RIGID TRANSLATION — same vector for every sample",
+        fontsize=10, fontweight="bold",
+    )
+    ax2.legend(fontsize=9, markerscale=2)
+    ax2.grid(True, alpha=0.2)
+
+    fig2.suptitle(
+        "W vs b: Two-Step Decomposition with Per-Sample Arrows\n"
+        f"b (red) is a constant shift; W·z_c (purple) is sample-dependent but small\n"
+        f"b share of total L2 correction budget: {frac_b:.0f}%",
+        fontsize=11, fontweight="bold",
+    )
+    fig2.tight_layout()
+    _save(fig2, out_dir / "pca_decomposed_arrows.png")
+    print(f"  W vs b arrows      → {out_dir}/pca_decomposed_arrows.png")
+
+
+# ---------------------------------------------------------------------------
+# PCA: multiple component pairs
+# ---------------------------------------------------------------------------
+
+def analysis_pca_multipanel(
+    df: pd.DataFrame, out_dir: Path, n_components: int = 8
+) -> None:
+    """
+    Show z_c, ẑ, z_12 in every pair of the top principal components.
+
+    PC1-PC2 explains ~99.4% of joint variance, so higher PCs capture tiny
+    residual structure — but that residual may still reveal whether the
+    rank-2 collapse is complete or whether some patients escape the 1D line.
+
+    Produces:
+        pca_multipanel.png  — grid of all pairs of the top n_show PCs
+    """
+    from sklearn.decomposition import PCA
+    from itertools import combinations
+
+    print("\n" + "═"*70)
+    print("  PCA Multi-Panel: Beyond PC1–PC2")
+    print("═"*70)
+
+    mask  = df["valid"].values
+    z_c   = np.stack(df.loc[mask, "z_c"].values)
+    z_hat = np.stack(df.loc[mask, "z_hat"].values)
+    z_12  = np.stack(df.loc[mask, "z_12"].values)
+    err   = np.abs(df.loc[mask, "pred_qt"].values - df.loc[mask, "tgt_qt"].values)
+    N     = len(z_c)
+
+    pca    = PCA(n_components=n_components, random_state=42)
+    all_nd = pca.fit_transform(np.concatenate([z_c, z_hat, z_12], axis=0))
+    zc_nd  = all_nd[0*N:1*N]
+    zh_nd  = all_nd[1*N:2*N]
+    z12_nd = all_nd[2*N:3*N]
+    ev     = pca.explained_variance_ratio_ * 100
+
+    print("  Variance explained per PC:")
+    cumvar = 0.0
+    for i, v in enumerate(ev):
+        cumvar += v
+        print(f"    PC{i+1}: {v:5.2f}%  (cumulative {cumvar:.2f}%)")
+
+    # Show all pairs of top-5 PCs (10 pairs total → 2×5 grid)
+    n_show = 5
+    pairs  = list(combinations(range(n_show), 2))   # 10 pairs
+    ncols  = 5
+    nrows  = 2
+
+    rng  = np.random.RandomState(0)
+    idx  = rng.choice(N, min(700, N), replace=False)
+
+    COLORS = {
+        "z_c":  "#E65100",
+        "z_hat": "#2E7D32",
+        "z_12": "#1565C0",
+    }
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 5 * nrows))
+    axes = axes.flatten()
+
+    for ax_i, (pi, pj) in enumerate(pairs):
+        ax = axes[ax_i]
+        ax.scatter(z12_nd[idx, pi], z12_nd[idx, pj],
+                   s=6, alpha=0.25, color=COLORS["z_12"], linewidths=0,
+                   label="z_12 (target)")
+        ax.scatter(zc_nd[idx, pi], zc_nd[idx, pj],
+                   s=6, alpha=0.30, color=COLORS["z_c"], linewidths=0,
+                   label="z_c (Lead-I)")
+        ax.scatter(zh_nd[idx, pi], zh_nd[idx, pj],
+                   s=6, alpha=0.30, color=COLORS["z_hat"], linewidths=0,
+                   label="ẑ (adapter)")
+        ax.set_xlabel(f"PC{pi+1} ({ev[pi]:.2f}%)", fontsize=9.5)
+        ax.set_ylabel(f"PC{pj+1} ({ev[pj]:.2f}%)", fontsize=9.5)
+        ax.set_title(f"PC{pi+1} vs PC{pj+1}", fontsize=10, fontweight="bold")
+        if ax_i == 0:
+            ax.legend(fontsize=8, markerscale=2)
+        ax.grid(True, alpha=0.2)
+
+    # Second pass: colour z_hat by |QT error| in the right column (last 2 panels)
+    # Use panels ncols..2*ncols as error-coloured versions of the first two pairs
+    for ax_extra_i in range(len(pairs), len(axes)):
+        axes[ax_extra_i].set_visible(False)
+
+    fig.suptitle(
+        "JEPA Embedding Space — All Pairs of Top-5 Principal Components\n"
+        f"PC1={ev[0]:.1f}%  PC2={ev[1]:.1f}%  PC3={ev[2]:.2f}%  "
+        f"PC4={ev[3]:.2f}%  PC5={ev[4]:.2f}%\n"
+        "Orange=z_c (Lead-I)   Green=ẑ (adapter output)   Blue=z_12 (12-lead target)",
+        fontsize=11, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.91])
+    _save(fig, out_dir / "pca_multipanel.png")
+    print(f"  Multi-panel PCA    → {out_dir}/pca_multipanel.png")
+
+    # ─── Bonus: error-coloured z_hat in every relevant pair ─────────────────
+    # Only show pairs where z_hat actually has visible spread (std > 0.05)
+    spread = [(pi, pj) for pi, pj in pairs
+              if zh_nd[:, pi].std() > 0.05 or zh_nd[:, pj].std() > 0.05]
+    if spread:
+        ncols2 = min(3, len(spread))
+        nrows2 = -(-len(spread) // ncols2)
+        fig3, axes3 = plt.subplots(nrows2, ncols2,
+                                   figsize=(5.5 * ncols2, 5 * nrows2), squeeze=False)
+        axes3 = axes3.flatten()
+        vmax = np.percentile(err, 95)
+        for ax_i, (pi, pj) in enumerate(spread):
+            ax = axes3[ax_i]
+            sc = ax.scatter(zh_nd[idx, pi], zh_nd[idx, pj],
+                            c=err[idx], cmap="hot_r", s=8, alpha=0.6,
+                            linewidths=0, vmin=0, vmax=vmax)
+            plt.colorbar(sc, ax=ax, label="|QT error| (ms)", shrink=0.85)
+            ax.set_xlabel(f"PC{pi+1} ({ev[pi]:.2f}%)", fontsize=9.5)
+            ax.set_ylabel(f"PC{pj+1} ({ev[pj]:.2f}%)", fontsize=9.5)
+            ax.set_title(f"ẑ — PC{pi+1} vs PC{pj+1} (coloured by error)",
+                         fontsize=10, fontweight="bold")
+            ax.grid(True, alpha=0.2)
+        for ax_i in range(len(spread), len(axes3)):
+            axes3[ax_i].set_visible(False)
+        fig3.suptitle("ẑ (adapter output) coloured by |QT error| — multiple PC pairs",
+                      fontsize=11, fontweight="bold")
+        fig3.tight_layout()
+        _save(fig3, out_dir / "pca_multipanel_error.png")
+        print(f"  Error-coloured     → {out_dir}/pca_multipanel_error.png")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -846,6 +1184,8 @@ def main():
     analysis_linear_w_svd(W, b, out_dir)
     analysis_contribution_ratio(df, out_dir)
     analysis_pca_embeddings(df, out_dir)
+    analysis_pca_decomposed(df, W, b, out_dir)
+    analysis_pca_multipanel(df, out_dir)
 
     if not args.no_ecg_plots:
         # filename_hr needs to come from the dataset index directly

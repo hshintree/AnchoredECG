@@ -94,9 +94,9 @@ from qt_dataset import QTFinetuneDataset, TARGET_LEN
 from validate_qt import ForcedLeadDataset, load_model
 from jepa_dataset import PairedLeadDataset, collate_paired, JEPAInferenceModel
 from qt_adapter import (
-    _MLPNet, _AttentionNet, _LoRANet, _GReLUNet,
+    _MLPNet, _AttentionNet, _LoRANet, _GReLUNet, _RWNANet,
     MLP_DEFAULT_CONFIG, ATTENTION_DEFAULT_CONFIG,
-    LORA_DEFAULT_CONFIG, GRELU_DEFAULT_CONFIG,
+    LORA_DEFAULT_CONFIG, GRELU_DEFAULT_CONFIG, RWNA_DEFAULT_CONFIG,
 )
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch.utils.data import DataLoader as TorchDataLoader
@@ -111,7 +111,11 @@ DEFAULT_LABELS      = _SCRIPT_DIR / "qt_labels.csv"
 DEFAULT_SIGNALS_DIR = _DATA / "ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.1"
 DEFAULT_JEPA_DIR    = _SCRIPT_DIR / "checkpoints" / "jepa"
 
-JEPA_PREDICTOR_NAMES = ["linear", "mlp", "attention", "lora", "grelu"]
+JEPA_PREDICTOR_NAMES = ["linear", "mlp", "attention", "lora", "grelu", "lora16", "rwna",
+                        "cgrelu",     # m=1024 (full-size, frozen-adapter parity)
+                        "cgrelu512",  # m=512  (half neurons, ablation)
+                        "cgrelu256",  # m=256  (quarter neurons, ablation)
+                        ]
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +167,34 @@ def build_predictor(name: str, d: int = 192) -> nn.Module:
     elif name == "lora":
         cfg = LORA_DEFAULT_CONFIG
         return _LoRANet(d, d, rank=cfg["rank"], alpha=cfg["lora_alpha"])
+    elif name == "lora16":
+        # Rank-16 LoRA — ablation partner to RWNA (k=16); same bottleneck rank,
+        # linear vs nonlinear in the projected subspace.
+        return _LoRANet(d, d, rank=16, alpha=16.0)
     elif name == "grelu":
         cfg = GRELU_DEFAULT_CONFIG
         return _GReLUNet(d_input=d, d_output=d, m=cfg["m"], seed=cfg["seed"])
+    elif name.startswith("cgrelu"):
+        # Convex GReLU JEPA family — same _GReLUNet architecture as "grelu",
+        # but trained with two structural constraints that restore convexity:
+        #   1. proj.weight clamped ≥ 0 after every optimizer step (non-negative
+        #      output weights over ReLU-gated features = convex function of z_c)
+        #   2. L1 penalty on linear1.weight added to the loss (sparsity prior,
+        #      mimicking R-FISTA's proximal soft-threshold in the frozen adapter)
+        # Constraints enforced in _run_train_epoch when predictor_name.startswith("cgrelu").
+        #
+        # Variants (m = GReLU neuron count):
+        #   cgrelu     → m=1024  (frozen-adapter parity)
+        #   cgrelu512  → m=512   (half neurons)
+        #   cgrelu256  → m=256   (quarter neurons)
+        _m = {"cgrelu": 1024, "cgrelu512": 512, "cgrelu256": 256}.get(name, 1024)
+        return _GReLUNet(d_input=d, d_output=d, m=_m, seed=GRELU_DEFAULT_CONFIG["seed"])
+    elif name == "rwna":
+        cfg = RWNA_DEFAULT_CONFIG
+        # k=16 for JEPA E2E: wide enough gradient signal to potentially break the
+        # rank-2 collapse observed in JEPA-Linear (where the linear predictor's
+        # rank-2 gradient kept z_c near-degenerate even after 120 epochs of E2E training).
+        return _RWNANet(d, d, k=cfg["k"], hidden=cfg["hidden"])
     else:
         raise ValueError(
             f"Unknown predictor: {name!r}. "
@@ -403,8 +432,19 @@ def _run_train_epoch(
     lambda_qt: float,
     do_ema: bool,
     ema_tau: float,
+    lambda_l1_net: float = 0.0,
+    clamp_predictor_proj: bool = False,
 ) -> dict:
-    """Single training epoch.  Returns dict with avg losses."""
+    """Single training epoch.  Returns dict with avg losses.
+
+    Optional convex-GReLU constraints (cgrelu predictor only):
+      lambda_l1_net        : L1 penalty on predictor.linear1.weight added to the
+                             combined loss.  Mimics the R-FISTA proximal soft-threshold
+                             step used in the frozen GReLU adapter.
+      clamp_predictor_proj : After each optimizer.step(), clamp predictor.proj.weight
+                             to >= 0.  Non-negative output weights over ReLU-gated
+                             features guarantees the network is a convex function of z_c.
+    """
     context_encoder.train(); predictor.train(); qt_head.train()
     ema_encoder.eval()
 
@@ -437,9 +477,19 @@ def _run_train_epoch(
         L_qt   = F.mse_loss(qt_hat, qt_labels)
         loss   = lambda_jepa * L_jepa + lambda_qt * L_qt
 
+        # Optional L1 sparsity on GReLU linear1 weights (convex variant only)
+        if lambda_l1_net > 0.0 and hasattr(predictor, "linear1"):
+            loss = loss + lambda_l1_net * predictor.linear1.weight.abs().mean()
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # Convex projection: clamp proj.weight >= 0 after each gradient step.
+        # Non-negative output weights over ReLU-gated features = convex function of z_c.
+        if clamp_predictor_proj and hasattr(predictor, "proj"):
+            with torch.no_grad():
+                predictor.proj.weight.clamp_(min=0.0)
 
         # EMA update (only during Phase 2)
         if do_ema:
@@ -491,6 +541,16 @@ def run_jepa_training(args, predictor_name: str) -> None:
     print(f"  JEPA-{predictor_name.upper()}  end-to-end training")
     print(f"{'='*68}")
     t0_total = time.time()
+
+    # Convex-GReLU flags — active for all cgrelu* variants (cgrelu, cgrelu512, cgrelu256)
+    _is_cgrelu         = predictor_name.startswith("cgrelu")
+    _lambda_l1_net     = 1e-4 if _is_cgrelu else 0.0
+    _clamp_proj        = _is_cgrelu
+    if _is_cgrelu:
+        print(
+            f"  ConvexGReLU mode: L1 on linear1.weight (λ_l1={_lambda_l1_net})  "
+            f"+ proj.weight clamped ≥ 0 after each step"
+        )
 
     # ── W&B init ──────────────────────────────────────────────────────────
     # W&B run IDs must be alphanumeric + hyphens/underscores only — no dots.
@@ -617,6 +677,8 @@ def run_jepa_training(args, predictor_name: str) -> None:
                 train_loader, optimizer, device,
                 lambda_jepa=args.lambda_jepa, lambda_qt=args.lambda_qt,
                 do_ema=False, ema_tau=args.ema_tau,
+                lambda_l1_net=_lambda_l1_net,
+                clamp_predictor_proj=_clamp_proj,
             )
             scheduler.step()
             # Save after EVERY epoch — worst-case preemption loss is 1 epoch, not 10
@@ -700,6 +762,8 @@ def run_jepa_training(args, predictor_name: str) -> None:
             train_loader, optimizer, device,
             lambda_jepa=args.lambda_jepa, lambda_qt=args.lambda_qt,
             do_ema=True, ema_tau=args.ema_tau,
+            lambda_l1_net=_lambda_l1_net,
+            clamp_predictor_proj=_clamp_proj,
         )
         scheduler.step()
         # Save after EVERY epoch — worst-case preemption loss is 1 epoch, not 10
@@ -842,10 +906,13 @@ def main():
                         help="Predictor backbone(s) to train. Multiple → sequential run.")
 
     # Training phases
-    parser.add_argument("--warmup-epochs",   type=int, default=50,
-                        help="Phase 1: frozen-encoder warm-up epochs (0 to skip).")
-    parser.add_argument("--finetune-epochs", type=int, default=150,
-                        help="Phase 2: end-to-end fine-tune epochs.")
+    parser.add_argument("--warmup-epochs",   type=int, default=20,
+                        help="Phase 1: frozen-encoder warm-up epochs (0 to skip). "
+                             "Default reduced from 50→20 based on convergence analysis "
+                             "(JEPA-Linear variants converged 30-70 epochs into fine-tune).")
+    parser.add_argument("--finetune-epochs", type=int, default=80,
+                        help="Phase 2: end-to-end fine-tune epochs. "
+                             "Default reduced from 150→80 based on best-checkpoint analysis.")
     parser.add_argument("--eval-every",      type=int, default=10,
                         help="Evaluate on val every N epochs.")
 

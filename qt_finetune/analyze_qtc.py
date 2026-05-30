@@ -108,6 +108,16 @@ PALETTE = {
     "Lead I + JEPA-Linear (λ=0.5)": "#EF5350",  # red 400 (lighter, weaker QT loss)
     "Lead I + JEPA-Linear (λ=1.0)": "#B71C1C",  # red 900 (baseline)
     "Lead I + JEPA-Linear (λ=2.0)": "#4A0000",  # darkest red (strongest QT loss)
+    # Rank-2 adapters (frozen encoder) — motivated by SVD/PCA analysis
+    "Lead I + LoRA-rank2":          "#4E342E",  # deep brown
+    "Lead I + RWNA":                "#F57F17",  # deep amber
+    # Rank-16 JEPA end-to-end — ablation: linear vs nonlinear bottleneck at same rank
+    "Lead I + JEPA-LoRA16":         "#006064",  # dark teal
+    "Lead I + JEPA-RWNA":           "#E65100",  # deep orange
+    # Convex GReLU JEPA family — structural convexity enforced via proj.weight≥0 + L1 on linear1
+    # Two neuron-count ablations (m=512 and m=256) run in parallel.
+    "Lead I + JEPA-CvxGReLU-512":   "#4A148C",  # very dark purple
+    "Lead I + JEPA-CvxGReLU-256":   "#7B1FA2",  # medium purple
 }
 LS = {
     "12-lead":             "-",
@@ -130,6 +140,15 @@ LS = {
     "Lead I + JEPA-Linear (λ=0.5)": (0, (4, 1, 1, 1)),   # dash-dot-dot (short)
     "Lead I + JEPA-Linear (λ=1.0)": (0, (5, 1, 1, 1)),   # dash-dot-dot (medium)
     "Lead I + JEPA-Linear (λ=2.0)": (0, (6, 1, 1, 1)),   # dash-dot-dot (long)
+    # Rank-2 frozen adapters
+    "Lead I + LoRA-rank2":          (0, (3, 1)),          # short dense dash
+    "Lead I + RWNA":                (0, (2, 1, 4, 1)),    # short-long alternating
+    # Rank-16 JEPA end-to-end
+    "Lead I + JEPA-LoRA16":         (0, (5, 2, 1, 2)),    # long-short alternating
+    "Lead I + JEPA-RWNA":           (0, (3, 1, 3, 1, 1, 1)),  # dash-dash-dot
+    # Convex GReLU JEPA family
+    "Lead I + JEPA-CvxGReLU-512":   (0, (4, 1, 2, 1, 1, 1)),  # long-medium-short
+    "Lead I + JEPA-CvxGReLU-256":   (0, (2, 1, 4, 1, 2, 1)),  # short-long-short
 }
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1198,13 @@ def main():
         "linear_lqt0.5":  "Lead I + JEPA-Linear (λ=0.5)",
         "linear_lqt1.0":  "Lead I + JEPA-Linear (λ=1.0)",
         "linear_lqt2.0":  "Lead I + JEPA-Linear (λ=2.0)",
+        # Rank-16 JEPA end-to-end — ablation: does wider gradient signal break rank-2 collapse?
+        "lora16":         "Lead I + JEPA-LoRA16",
+        "rwna":           "Lead I + JEPA-RWNA",
+        # Convex GReLU family — proj.weight≥0 + L1 restores convexity structure in E2E setting
+        "cgrelu":         "Lead I + JEPA-CvxGReLU-512",   # m=1024 kept for compat, maps to generic label
+        "cgrelu512":      "Lead I + JEPA-CvxGReLU-512",
+        "cgrelu256":      "Lead I + JEPA-CvxGReLU-256",
     }
     # Scan all non-resume jepa_*.pt files under _jepa_dir
     _jepa_found = {}   # display_label → path

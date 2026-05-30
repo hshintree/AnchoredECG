@@ -1204,6 +1204,83 @@ class _LoRANet(nn.Module):
         return self.B(self.A(x)) * self.scale
 
 
+# ---------------------------------------------------------------------------
+# _RWNANet  (Rank-k Whitened Nonlinear Adapter)
+# ---------------------------------------------------------------------------
+
+class _RWNANet(nn.Module):
+    """
+    Rank-k Whitened Nonlinear Adapter (RWNA).
+
+    Motivated by the SVD analysis of the JEPA-Linear weight matrix W, which
+    shows only k=2 dominant singular values and PC1+PC2 = 99.4% of the
+    combined embedding-space variance.  Rather than applying a full 192×192
+    linear map (37k parameters), RWNA:
+
+      1. Projects z_c to a k-dimensional signal subspace  (proj_in, 192→k)
+      2. Applies a small MLP in that k-dimensional space   (k→hidden→k)
+      3. Projects the correction back to 192-dim           (proj_out, k→192)
+      4. Adds a learned bias term b ∈ ℝ^192               (matches the
+         dominant ||b|| >> ||W||_F pattern in JEPA-Linear)
+
+    Total parameters with k=2, hidden=32: ~700 vs 37,056 for linear.
+
+    Identity initialisation:
+      proj_in/proj_out — Kaiming uniform (small initial correction)
+      MLP final layer  — zeros (so the residual starts at b only)
+      b                — zeros (pure identity at init)
+
+    Forward:
+        t      = proj_in(z)              (B, k)
+        delta  = mlp(t)                  (B, k)
+        return proj_out(delta) + b       (B, d_output)
+    """
+
+    def __init__(
+        self,
+        d_input:  int,
+        d_output: int,
+        k:        int = 2,
+        hidden:   int = 32,
+    ):
+        super().__init__()
+        self.k = k
+        self.proj_in  = nn.Linear(d_input, k, bias=False)
+        self.mlp      = nn.Sequential(
+            nn.Linear(k, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, k),
+        )
+        self.proj_out = nn.Linear(k, d_output, bias=False)
+        self.bias     = nn.Parameter(torch.zeros(d_output))
+        # Zero-init final MLP layer so residual correction starts at 0
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        t     = self.proj_in(x)          # (B, k)
+        delta = self.mlp(t)              # (B, k)
+        return self.proj_out(delta) + self.bias   # (B, d_output)
+
+
+RWNA_DEFAULT_CONFIG: dict = {
+    "d_input":      192,
+    "d_output":     192,
+    "k":            16,    # rank of projection subspace; k=2 for frozen z_c (near-degenerate),
+                           # k=16 for JEPA E2E (encoder learns richer representations)
+    "hidden":       64,    # MLP hidden size in the k-dim projected space
+    "lr":           1e-3,
+    "weight_decay": 1e-4,
+    "epochs":       200,
+    "eval_every":   20,
+    "batch_size":   256,
+    "seed":         42,
+}
+
+# Frozen-adapter variant: small k because frozen z_c is near-degenerate (2 dominant SVD modes)
+RWNA_FROZEN_CONFIG: dict = {**RWNA_DEFAULT_CONFIG, "k": 2, "hidden": 32}
+
+
 LORA_DEFAULT_CONFIG: dict = {
     "d_input":      192,
     "d_output":     192,
@@ -1497,4 +1574,167 @@ def load_lora(path: str | Path) -> LoRAResidualAdapter:
     adapter._d_input  = ckpt["d_input"]
     adapter._d_output = ckpt["d_output"]
     print(f"    LoRA adapter loaded ← {path}")
+    return adapter
+
+
+# ---------------------------------------------------------------------------
+# RWNAResidualAdapter  — frozen-encoder, latent-space adapter
+# ---------------------------------------------------------------------------
+
+class RWNAResidualAdapter:
+    """
+    Rank-k Whitened Nonlinear Adapter trained with AdamW + CosineAnnealingLR
+    on cached latents.  Numpy-facing interface matching all other adapters.
+
+    Args:
+        k       : rank of the projection subspace (default 2, motivated by SVD)
+        hidden  : hidden size of the 2-layer MLP in the projected space
+    """
+
+    def __init__(
+        self,
+        k:            int   = 2,
+        hidden:       int   = 32,
+        lr:           float = 1e-3,
+        weight_decay: float = 1e-4,
+        epochs:       int   = 200,
+        eval_every:   int   = 20,
+        batch_size:   int   = 256,
+        seed:         int   = 42,
+        device:       str | None = None,
+    ):
+        self.k            = k
+        self.hidden       = hidden
+        self.lr           = lr
+        self.weight_decay = weight_decay
+        self.epochs       = epochs
+        self.eval_every   = eval_every
+        self.batch_size   = batch_size
+        self.seed         = seed
+        self._device_str  = device
+        self._net: _RWNANet | None = None
+        self._d_input:  int = 192
+        self._d_output: int = 192
+
+    # -- internals -----------------------------------------------------------
+
+    def _get_device(self) -> torch.device:
+        if self._device_str:
+            return torch.device(self._device_str)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    # -- public API ----------------------------------------------------------
+
+    def fit(
+        self,
+        z_src: np.ndarray,   # (N, d_input)  — Lead-I latents
+        z_tgt: np.ndarray,   # (N, d_output) — 12-lead latents
+    ) -> "RWNAResidualAdapter":
+        torch.manual_seed(self.seed)
+        device = self._get_device()
+        self._d_input  = z_src.shape[1]
+        self._d_output = z_tgt.shape[1]
+
+        net = _RWNANet(self._d_input, self._d_output, k=self.k, hidden=self.hidden)
+        net = net.to(device)
+        self._net = net
+
+        optimizer = AdamW(net.parameters(),
+                          lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs)
+
+        # Residuals: predict z_tgt - z_src
+        r_tr = torch.from_numpy(z_tgt - z_src).float()
+        z_tr = torch.from_numpy(z_src).float()
+        ds   = TensorDataset(z_tr, r_tr)
+        dl   = TorchDataLoader(ds, batch_size=self.batch_size, shuffle=True)
+
+        net.train()
+        for ep in range(1, self.epochs + 1):
+            total_loss = 0.0
+            for zb, rb in dl:
+                zb, rb = zb.to(device), rb.to(device)
+                pred = net(zb)
+                loss = F.mse_loss(pred, rb)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item() * zb.size(0)
+            scheduler.step()
+            if ep % self.eval_every == 0 or ep == self.epochs:
+                print(f"    RWNA ep {ep:4d}/{self.epochs}  "
+                      f"MSE={total_loss/len(ds):.4f}")
+
+        net.eval()
+        return self
+
+    def transform(self, z_src: np.ndarray) -> np.ndarray:
+        assert self._net is not None, "Call fit() first"
+        device = self._get_device()
+        self._net.to(device).eval()
+        with torch.no_grad():
+            z = torch.from_numpy(z_src).float().to(device)
+            r = self._net(z)
+            return (z + r).cpu().numpy()
+
+
+def save_rwna(
+    adapter: RWNAResidualAdapter,
+    path: str | Path,
+    config: dict | None = None,
+) -> None:
+    """Save a fitted RWNAResidualAdapter to *path* via torch.save."""
+    assert adapter._net is not None, "Adapter must be fitted before saving"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": adapter._net.state_dict(),
+            "d_input":    adapter._d_input,
+            "d_output":   adapter._d_output,
+            "k":          adapter.k,
+            "hidden":     adapter.hidden,
+            "config": {
+                "lr":           adapter.lr,
+                "weight_decay": adapter.weight_decay,
+                "epochs":       adapter.epochs,
+                "eval_every":   adapter.eval_every,
+                "batch_size":   adapter.batch_size,
+                "seed":         adapter.seed,
+                **(config or {}),
+            },
+        },
+        path,
+    )
+    print(f"    RWNA adapter saved → {path}")
+
+
+def load_rwna(path: str | Path) -> RWNAResidualAdapter:
+    """Load a RWNAResidualAdapter from *path*.  Returns adapter ready for transform()."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    cfg  = ckpt.get("config") or {}
+    adapter = RWNAResidualAdapter(
+        k            = int(  ckpt.get("k",      RWNA_DEFAULT_CONFIG["k"])),
+        hidden       = int(  ckpt.get("hidden", RWNA_DEFAULT_CONFIG["hidden"])),
+        lr           = float(cfg.get("lr",           RWNA_DEFAULT_CONFIG["lr"])),
+        weight_decay = float(cfg.get("weight_decay", RWNA_DEFAULT_CONFIG["weight_decay"])),
+        epochs       = int(  cfg.get("epochs",       RWNA_DEFAULT_CONFIG["epochs"])),
+        eval_every   = int(  cfg.get("eval_every",   RWNA_DEFAULT_CONFIG["eval_every"])),
+        batch_size   = int(  cfg.get("batch_size",   RWNA_DEFAULT_CONFIG["batch_size"])),
+        seed         = int(  cfg.get("seed",         RWNA_DEFAULT_CONFIG["seed"])),
+    )
+    net = _RWNANet(
+        d_input=ckpt["d_input"], d_output=ckpt["d_output"],
+        k=adapter.k, hidden=adapter.hidden,
+    )
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    adapter._net      = net
+    adapter._d_input  = ckpt["d_input"]
+    adapter._d_output = ckpt["d_output"]
+    print(f"    RWNA adapter loaded ← {path}")
     return adapter
