@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AnchoredECG QT</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace" aria-label="ECG QT interval workspace">
+        <aside class="sidebar">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true">
+              <span></span>
+            </div>
+            <div>
+              <p class="eyebrow">AnchoredECG</p>
+              <h1>Watch ECG QT</h1>
+            </div>
+          </div>
+
+          <label class="dropzone" id="dropzone">
+            <input id="fileInput" type="file" accept=".csv,.txt,text/csv,text/plain" />
+            <span class="upload-icon" aria-hidden="true">+</span>
+            <span class="upload-title">Upload waveform</span>
+            <span class="upload-meta">CSV or TXT from ECG export</span>
+          </label>
+
+          <div class="actions">
+            <button id="demoButton" class="primary-button" type="button">Load demo ECG</button>
+            <button id="clearButton" class="ghost-button" type="button">Clear</button>
+          </div>
+
+          <div class="field-grid">
+            <label>
+              <span>Lead</span>
+              <select id="leadSelect">
+                <option value="I">Lead I</option>
+                <option value="II">Lead II</option>
+                <option value="unknown">Unknown</option>
+              </select>
+            </label>
+            <label>
+              <span>QTc formula</span>
+              <select id="formulaSelect">
+                <option value="fridericia">Fridericia</option>
+                <option value="bazett">Bazett</option>
+                <option value="framingham">Framingham</option>
+              </select>
+            </label>
+            <label>
+              <span>Adult range</span>
+              <select id="sexSelect">
+                <option value="male">Men</option>
+                <option value="female">Women</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="source-card">
+            <p class="card-label">Current file</p>
+            <p id="fileName" class="file-name">No waveform loaded</p>
+            <p id="fileMeta" class="file-meta">Awaiting ECG samples</p>
+          </div>
+
+          <div class="notice">
+            <strong>Research preview.</strong>
+            <span>Single-lead watch ECGs are noisy and are not a diagnostic QT measurement.</span>
+          </div>
+        </aside>
+
+        <section class="main-panel">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Interval Review</p>
+              <h2 id="statusTitle">Ready for ECG upload</h2>
+            </div>
+            <div class="quality-pill" id="qualityPill">No signal</div>
+          </header>
+
+          <section class="metric-row" aria-label="QT measurements">
+            <article class="metric-card accent-qt">
+              <p>QT interval</p>
+              <strong id="qtValue">--</strong>
+              <span id="qtSub">milliseconds</span>
+            </article>
+            <article class="metric-card accent-qtc" id="qtcCard">
+              <p>Corrected QT</p>
+              <strong id="qtcValue">--</strong>
+              <span id="qtcSub">QTc</span>
+            </article>
+            <article class="metric-card accent-hr">
+              <p>Heart rate</p>
+              <strong id="hrValue">--</strong>
+              <span>beats per minute</span>
+            </article>
+          </section>
+
+          <section class="waveform-section">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Waveform</p>
+                <h3>Three 10-second ECG strips</h3>
+              </div>
+              <div id="markerLegend" class="marker-legend">
+                <span><i class="q-marker"></i>Q onset</span>
+                <span><i class="t-marker"></i>T end</span>
+              </div>
+            </div>
+            <div class="canvas-wrap">
+              <canvas id="waveCanvas" width="1280" height="720"></canvas>
+            </div>
+          </section>
+
+          <section class="details-grid">
+            <article class="interval-card" id="intervalCard">
+              <p class="card-label">QTc interpretation</p>
+              <h4 id="intervalTitle">No QTc available</h4>
+              <p id="intervalText">Upload an ECG to compare QTc with the selected adult range.</p>
+            </article>
+            <article>
+              <p class="card-label">Signal quality</p>
+              <h4 id="qualityTitle">No ECG loaded</h4>
+              <p id="qualityText">Upload a waveform or load the demo ECG.</p>
+            </article>
+            <article>
+              <p class="card-label">Detected landmarks</p>
+              <dl class="landmarks">
+                <div><dt>R peaks</dt><dd id="rPeaks">--</dd></div>
+                <div><dt>Q onset</dt><dd id="qOnset">--</dd></div>
+                <div><dt>T end</dt><dd id="tEnd">--</dd></div>
+                <div><dt>RR interval</dt><dd id="rrInterval">--</dd></div>
+              </dl>
+            </article>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
