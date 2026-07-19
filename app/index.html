@@ -64,6 +64,12 @@
             <p id="fileMeta" class="file-meta">Awaiting ECG samples</p>
           </div>
 
+          <div class="source-card">
+            <p class="card-label">Inference</p>
+            <p id="modelName" class="file-name">128 Hz checkpoint</p>
+            <p id="modelMeta" class="file-meta">Run the local ML server before uploading.</p>
+          </div>
+
           <div class="notice">
             <strong>Research preview.</strong>
             <span>Single-lead watch ECGs are noisy and are not a diagnostic QT measurement.</span>
@@ -128,8 +134,8 @@
               <p class="card-label">Detected landmarks</p>
               <dl class="landmarks">
                 <div><dt>R peaks</dt><dd id="rPeaks">--</dd></div>
-                <div><dt>Q onset</dt><dd id="qOnset">--</dd></div>
-                <div><dt>T end</dt><dd id="tEnd">--</dd></div>
+                <div><dt>Q onset from R</dt><dd id="qOnset">--</dd></div>
+                <div><dt>T end from R</dt><dd id="tEnd">--</dd></div>
                 <div><dt>RR interval</dt><dd id="rrInterval">--</dd></div>
               </dl>
             </article>

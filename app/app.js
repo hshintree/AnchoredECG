@@ -7,6 +7,8 @@ const els = {
   sexSelect: document.getElementById("sexSelect"),
   fileName: document.getElementById("fileName"),
   fileMeta: document.getElementById("fileMeta"),
+  modelName: document.getElementById("modelName"),
+  modelMeta: document.getElementById("modelMeta"),
   statusTitle: document.getElementById("statusTitle"),
   qualityPill: document.getElementById("qualityPill"),
   qtValue: document.getElementById("qtValue"),
@@ -185,6 +187,7 @@ function analyzeSignal(raw, name) {
 
   return {
     name,
+    source: "heuristic",
     fs,
     duration: raw.duration,
     sampleCount: raw.y.length,
@@ -374,23 +377,27 @@ function renderAnalysis(analysis) {
   const interpretation = interpretQtc(analysis.qtc, els.sexSelect.value);
   els.fileName.textContent = analysis.name;
   els.fileMeta.textContent = `${analysis.sampleCount.toLocaleString()} samples · ${analysis.fs.toFixed(0)} Hz · ${analysis.duration.toFixed(1)} s`;
-  els.statusTitle.textContent = "QT interval estimated";
+  els.statusTitle.textContent = analysis.source === "ml" ? "ML QT interval estimated" : "QT interval estimated";
   els.qualityPill.textContent = analysis.quality.level === "good" ? "Readable" : analysis.quality.level === "caution" ? "Review" : "Low confidence";
   els.qualityPill.className = `quality-pill ${analysis.quality.level}`;
   els.qtValue.textContent = Math.round(analysis.qtMs);
-  els.qtSub.textContent = "milliseconds";
+  els.qtSub.textContent = analysis.source === "ml" ? "ML median, milliseconds" : "milliseconds";
   els.qtcValue.textContent = Math.round(analysis.qtc);
   els.qtcSub.textContent = `${formulaName} QTc`;
   els.qtcCard.className = `metric-card accent-qtc ${interpretation.level}`;
   els.hrValue.textContent = Math.round(analysis.hr);
+  els.modelName.textContent = analysis.source === "ml" ? analysis.modelName : "Heuristic fallback";
+  els.modelMeta.textContent = analysis.source === "ml"
+    ? `${analysis.modelMeta} · QT interval ${Math.round(analysis.qtLowerMs)}-${Math.round(analysis.qtUpperMs)} ms`
+    : "Browser-only estimate; start the local ML server for checkpoint inference.";
   els.intervalCard.className = `interval-card ${interpretation.level}`;
   els.intervalTitle.textContent = interpretation.title;
   els.intervalText.textContent = interpretation.text;
   els.qualityTitle.textContent = analysis.quality.title;
   els.qualityText.textContent = analysis.quality.text;
   els.rPeaks.textContent = analysis.peaks.length;
-  els.qOnset.textContent = `${Math.round((analysis.landmarks.qOnset - analysis.landmarks.r) * 1000 / analysis.fs)} ms`;
-  els.tEnd.textContent = `${Math.round((analysis.landmarks.tEnd - analysis.landmarks.r) * 1000 / analysis.fs)} ms`;
+  els.qOnset.textContent = formatRelativeMs((analysis.landmarks.qOnset - analysis.landmarks.r) * 1000 / analysis.fs);
+  els.tEnd.textContent = formatRelativeMs((analysis.landmarks.tEnd - analysis.landmarks.r) * 1000 / analysis.fs);
   els.rrInterval.textContent = `${Math.round(analysis.rrSec * 1000)} ms`;
   drawWaveform(analysis);
 }
@@ -552,22 +559,28 @@ function drawQtBracket(ctx, qX, tX, y, label) {
 }
 
 function loadText(text, name) {
-  try {
-    const parsed = parseDelimited(text);
-    const analysis = analyzeSignal(parsed, name);
-    renderAnalysis(analysis);
-  } catch (error) {
-    showError(error.message);
-  }
+  els.modelName.textContent = "Checking ML server...";
+  els.modelMeta.textContent = "Trying the 128 Hz checkpoint path.";
+  els.statusTitle.textContent = "Running ML inference";
+  els.qualityPill.textContent = "ML pending";
+  els.qualityPill.className = "quality-pill";
+  els.fileName.textContent = name;
+  els.fileMeta.textContent = "Waiting for the local checkpoint server.";
+
+  requestMlInference(text, name)
+    .then((payload) => renderAnalysis(analysisFromMl(payload, name)))
+    .catch((error) => showError(`ML server unavailable: ${error.message}`));
 }
 
 function showError(message) {
   currentAnalysis = null;
-  els.statusTitle.textContent = "Waveform could not be analyzed";
-  els.qualityPill.textContent = "Check file";
+  els.statusTitle.textContent = "ML inference failed";
+  els.qualityPill.textContent = "Check server";
   els.qualityPill.className = "quality-pill poor";
   els.fileMeta.textContent = message;
-  els.qualityTitle.textContent = "Import failed";
+  els.modelName.textContent = "Inference unavailable";
+  els.modelMeta.textContent = "Start the local server and retry the upload.";
+  els.qualityTitle.textContent = "No ML result";
   els.qualityText.textContent = message;
   els.qtValue.textContent = "--";
   els.qtcCard.className = "metric-card accent-qtc";
@@ -588,6 +601,8 @@ function clearAnalysis() {
   els.fileInput.value = "";
   els.fileName.textContent = "No waveform loaded";
   els.fileMeta.textContent = "Awaiting ECG samples";
+  els.modelName.textContent = "128 Hz checkpoint";
+  els.modelMeta.textContent = "Run the local ML server before uploading.";
   els.statusTitle.textContent = "Ready for ECG upload";
   els.qualityPill.textContent = "No signal";
   els.qualityPill.className = "quality-pill";
@@ -671,6 +686,81 @@ function std(values) {
 
 function derivative(values) {
   return values.map((value, index) => (index === 0 ? 0 : value - values[index - 1]));
+}
+
+function formatRelativeMs(value) {
+  const rounded = Math.round(value);
+  if (rounded < 0) return `${Math.abs(rounded)} ms before R`;
+  if (rounded > 0) return `${rounded} ms after R`;
+  return "at R";
+}
+
+async function requestMlInference(text, name) {
+  const endpoints = endpointCandidates();
+  let lastError = "";
+  for (const endpoint of endpoints) {
+    const form = new FormData();
+    form.append("file", new Blob([text], { type: "text/plain" }), name);
+    try {
+      const response = await fetch(endpoint, { method: "POST", body: form });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      return payload;
+    } catch (error) {
+      lastError = error.message;
+    }
+  }
+  throw new Error(lastError || "ML server unavailable");
+}
+
+function endpointCandidates() {
+  const localPorts = Array.from({ length: 20 }, (_, index) => `http://127.0.0.1:${8000 + index}/api/infer`);
+  if (location.protocol === "file:") return localPorts;
+  return ["/api/infer", ...localPorts];
+}
+
+function analysisFromMl(payload, fallbackName) {
+  const fs = payload.waveform.fs;
+  const cleaned = payload.waveform.values.map(Number);
+  const rrSec = Number.isFinite(payload.rrSec) && payload.rrSec > 0 ? payload.rrSec : 1;
+  const hr = Number.isFinite(payload.hr) && payload.hr > 0 ? payload.hr : 60 / rrSec;
+  const qOffset = Math.round(fs * 0.04);
+  const tOffset = Math.max(qOffset + 1, Math.round((payload.qtMs / 1000 - 0.04) * fs));
+  const firstPeak = payload.peaks && payload.peaks.length ? payload.peaks[0] : Math.round(fs * 0.5);
+  const rIndex = Math.min(Math.max(firstPeak, qOffset), Math.max(qOffset, cleaned.length - tOffset - 1));
+  const qOnset = Math.max(0, rIndex - qOffset);
+  const tEnd = Math.min(cleaned.length - 1, rIndex + tOffset);
+
+  return {
+    name: payload.filename || fallbackName,
+    source: "ml",
+    modelName: payload.model,
+    modelMeta: `128 Hz ResNet pinball tail-loss · ${payload.windows.length} model windows`,
+    fs,
+    duration: payload.duration,
+    sampleCount: payload.sampleCount,
+    cleaned,
+    peaks: payload.peaks || [],
+    rrSamples: rrSec * fs,
+    hr,
+    beat: {
+      y: cleaned.slice(Math.max(0, rIndex - Math.round(fs * 0.28)), rIndex + Math.round(fs * 0.62)),
+      rIndex: Math.round(fs * 0.28),
+      beatCount: payload.windows.length,
+    },
+    landmarks: { qOnset, r: rIndex, tPeak: Math.round((qOnset + tEnd) / 2), tEnd },
+    qtMs: payload.qtMs,
+    qtLowerMs: payload.qtLowerMs,
+    qtUpperMs: payload.qtUpperMs,
+    qtc: correctQt(payload.qtMs, rrSec, els.formulaSelect.value),
+    rrSec,
+    quality: {
+      level: "good",
+      title: "ML checkpoint inference",
+      text: `QT was predicted by the 128 Hz lead-I ResNet checkpoint across ${payload.windows.length} ten-second windows.`,
+    },
+    mlWindows: payload.windows,
+  };
 }
 
 els.fileInput.addEventListener("change", () => {

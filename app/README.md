@@ -1,8 +1,21 @@
 # AnchoredECG QT App
 
-Static prototype for estimating QT/QTc from an uploaded single-lead ECG waveform.
+Prototype for estimating QT/QTc from an uploaded single-lead ECG waveform.
 
-Open `index.html` in a browser. No build step or server is required.
+For the real ML path, run the local server from the repo root:
+
+```bash
+python3 app/server.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000
+```
+
+The server uses `qt_finetune/checkpoints/best_resnet_lead1_128hz_pinball_tailloss.pt`.
+Opening `index.html` directly still works, but it uses the browser-only heuristic fallback unless the local server is running.
 
 The waveform display is formatted as three 10-second ECG strips, matching the current recording format used in this repo.
 
