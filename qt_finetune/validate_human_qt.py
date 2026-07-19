@@ -273,7 +273,7 @@ def report(pred, ref, label):
     print(f"  slope pred~ref = {slope:.2f}  (1.00 = faithful, <1 = compressed range)")
 
 
-def report_qtc(pred, ref, rr, corrections=("bazett", "fridericia")):
+def report_qtc(pred, ref, rr, corrections=("bazett", "fridericia"), upper=None):
     """QTc derived from the MEASURED RR — never a predicted one.
 
     RR is trivially and accurately recoverable from the ECG, so composing
@@ -283,8 +283,11 @@ def report_qtc(pred, ref, rr, corrections=("bazett", "fridericia")):
     one formula.
     """
     pred, ref, rr = (np.asarray(a, float) for a in (pred, ref, rr))
+    up = np.asarray(upper, float) if upper is not None else None
     ok = np.isfinite(rr) & (rr > 0)
     pred, ref, rr = pred[ok], ref[ok], rr[ok]
+    if up is not None:
+        up = up[ok]
     if len(ref) < 5:
         return
     bias = np.median(pred - ref)
@@ -334,6 +337,24 @@ def report_qtc(pred, ref, rr, corrections=("bazett", "fridericia")):
               f"{'usable' if auc > 0.75 else 'weak'}, so a lower operating "
               f"threshold trades false alarms for sensitivity")
 
+    # --- the payoff of quantile regression: flag on an UPPER quantile ---------
+    # The median is a best guess; for a safety screen the question is "could
+    # this be prolonged?", which the upper quantile answers directly.
+    if up is not None and np.isfinite(up).all():
+        upc = up - bias
+        print(f"\n  flagging on the upper quantile instead of the median:")
+        for thr in (450, 500):
+            pos = qr > thr
+            if pos.sum() == 0:
+                continue
+            qu = F["bazett"](upc, rr)
+            tp = int((pos & (qu > thr)).sum())
+            fp = int((~pos & (qu > thr)).sum())
+            tp_m = int((pos & (qp > thr)).sum())
+            print(f"    QTc>{thr}: caught {tp}/{int(pos.sum())} "
+                  f"({tp/pos.sum()*100:.0f}% sens) with {fp} false alarms   "
+                  f"[median-based was {tp_m}/{int(pos.sum())}]")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -359,18 +380,26 @@ def main():
             ap.error("--ckpt is required unless --dry-run")
         import torch
         from ecg_resnet1d import ECGResNet1d
+        from qt_objective import Objective
         ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
         target_fs = target_fs or ck.get("target_fs")
         leads = leads or ck.get("leads", "lead1")
         in_ch = ck.get("in_channels", 1)
+        # MSE checkpoints predate these keys and default to a scalar head
+        loss_mode = ck.get("loss", "mse")
+        quantiles = tuple(ck.get("quantiles", (0.5,)))
+        n_out = ck.get("num_outputs", 1)
         if target_fs is None:
             ap.error("checkpoint has no target_fs; pass --target-fs")
-        model = ECGResNet1d(in_channels=in_ch)
+        model = ECGResNet1d(in_channels=in_ch, num_outputs=n_out)
         model.load_state_dict(ck["model_state_dict"])
         model.eval()
+        objective = Objective(loss_mode, quantiles).to(torch.device("cpu"))
         print(f"Loaded {args.ckpt}")
-        print(f"  leads={leads}  in_channels={in_ch}  target_fs={target_fs} Hz  "
-              f"(trained val MAE {ck.get('val_mae', float('nan')):.2f} ms vs 12SL)")
+        print(f"  leads={leads}  in_channels={in_ch}  target_fs={target_fs} Hz")
+        print(f"  loss={loss_mode}  quantiles={quantiles}  "
+              f"tail_weighting={ck.get('tail_weighting', 'none')}")
+        print(f"  trained val MAE {ck.get('val_mae', float('nan')):.2f} ms vs 12SL")
     else:
         target_fs = target_fs or 512
         leads = leads or "lead1"
@@ -384,6 +413,7 @@ def main():
         args.limit, args.local_dir, leads)
 
     ids, preds, refs, rrs, spreads = [], [], [], [], []
+    q_lo, q_hi = [], []
     L = window_len(target_fs)
     import torch
     for rec, x, fs, ref, rr, per_lead in gen:
@@ -393,8 +423,12 @@ def main():
         xr = xr[..., :L]
         if model is not None:
             with torch.no_grad():
-                p = float(model(torch.from_numpy(xr)[None])["logits"].item())
+                logits = model(torch.from_numpy(xr)[None])["logits"]
+                p = float(objective.point(logits).item())
+                lo, hi = objective.interval(logits)
             preds.append(p)
+            q_lo.append(float(lo.item()) if lo is not None else float("nan"))
+            q_hi.append(float(hi.item()) if hi is not None else float("nan"))
         ids.append(rec)
         refs.append(ref)
         rrs.append(rr)
@@ -421,7 +455,15 @@ def main():
         print("  Data path OK. Re-run with --ckpt to score a model.")
     else:
         report(preds, refs, f"{args.db} / leads={leads} / {target_fs} Hz")
-        report_qtc(preds, refs, rrs)
+        if np.isfinite(q_lo).any():
+            lo_a, hi_a, ref_a = (np.asarray(a, float) for a in (q_lo, q_hi, refs))
+            inside = ((ref_a >= lo_a) & (ref_a <= hi_a)).mean() * 100
+            nominal = (quantiles[-1] - quantiles[0]) * 100
+            print(f"\n  prediction interval [q{quantiles[0]:g}, q{quantiles[-1]:g}]: "
+                  f"covers {inside:.1f}% of references (nominal {nominal:.0f}%), "
+                  f"median width {np.median(hi_a-lo_a):.1f} ms")
+        report_qtc(preds, refs, rrs,
+                   upper=q_hi if np.isfinite(q_hi).any() else None)
 
     if args.save_csv:
         import csv
