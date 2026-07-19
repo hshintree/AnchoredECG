@@ -87,6 +87,9 @@ def train_resnet(leads: str, epochs: int = 50, batch_size: int = 128,
         sys.executable,
         "/repo/qt_finetune/train_resnet_qt.py",
         "--leads", leads,
+        # Pinned: this script is the PTB-XL-native 500 Hz baseline. The
+        # Apple-oriented rates live in modal_resnet_qt_apple.py.
+        "--target-fs", "500",
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--patience", str(patience),

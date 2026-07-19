@@ -5,8 +5,16 @@ Unlike ``QTFinetuneDataset`` (which builds an electrode graph), this returns the
 raw multi-channel waveform tensor for a fixed set of leads, so it can feed a
 plain CNN.
 
-Input  : (C, 5000) float32 — C leads @ native 500 Hz, NO resampling.
+Input  : (C, L) float32 — C leads, resampled to ``target_fs``.
 Target : QT_Int_Global (ms), single scalar.
+
+The target is in **milliseconds**, so it is independent of the input sample
+rate: changing ``target_fs`` changes the input length but never the label.
+
+``target_fs`` exists because we are optimising for Apple Watch input (512 Hz
+native). See ``rates.py`` for why 512 and 128 are the supported choices. The
+only transform applied is polyphase resampling — no normalisation, filtering,
+or augmentation.
 
 Splits follow the rest of the QT pipeline: strat_fold <= 8 train, == 9 val,
 == 10 test.
@@ -21,8 +29,7 @@ import torch
 import wfdb
 from torch.utils.data import Dataset
 
-PTBXL_FS = 500
-TARGET_LEN = 5000
+from rates import PTBXL_FS, DEFAULT_RATE, fit_length, resample_signal, window_len
 
 # PTB-XL lead order: I(0), II(1), III(2), aVR(3), aVL(4), aVF(5), V1-V6(6-11)
 PTBXL_LEAD_ORDER = ["I", "II", "III", "aVR", "aVL", "aVF",
@@ -45,6 +52,9 @@ class ResNetQTDataset(Dataset):
         split             : 'train' | 'val' | 'test'.
         lead_indices      : leads to keep, in PTB-XL order. [0] = lead I,
                             list(range(12)) = all 12 leads.
+        target_fs         : resample PTB-XL's native 500 Hz to this rate.
+                            512 = Apple Watch native, 128 = exact /4 of it,
+                            500 = no resampling (legacy baseline).
     """
 
     def __init__(
@@ -54,10 +64,13 @@ class ResNetQTDataset(Dataset):
         split: str = "train",
         lead_indices: list[int] | None = None,
         derived: str | None = None,
+        target_fs: int = DEFAULT_RATE,
     ):
         self.ptbxl_dir = Path(ptbxl_signals_dir)
         self.split = split
         self.derived = derived
+        self.target_fs = int(target_fs)
+        self.target_len = window_len(self.target_fs)
         if derived is not None and derived not in DERIVED_LEADS:
             raise ValueError(f"Unknown derived lead {derived!r}; "
                              f"options: {list(DERIVED_LEADS)}")
@@ -103,6 +116,11 @@ class ResNetQTDataset(Dataset):
         else:
             signals = signals[self.lead_indices]               # (C, 5000)
 
-        x = torch.from_numpy(np.ascontiguousarray(signals))    # (C, 5000)
+        # Resample after lead selection (cheaper, and resampling is per-channel).
+        if self.target_fs != PTBXL_FS:
+            signals = resample_signal(signals, PTBXL_FS, self.target_fs)
+        signals = fit_length(signals, self.target_len)          # (C, target_len)
+
+        x = torch.from_numpy(np.ascontiguousarray(signals))    # (C, target_len)
         qt = torch.tensor([item["qt_ms"]], dtype=torch.float32)
         return x, qt

@@ -1,5 +1,5 @@
 """
-Train a 1-D ResNet-18 on QT interval regression (PTB-XL, 500 Hz) — ablation.
+Train a 1-D ResNet-18 on QT interval regression (PTB-XL) — ablation.
 
 This is a from-scratch supervised baseline (no pretraining, no graph) used to
 check whether the electrode-graph GNN's lead-I result is meaningfully better
@@ -9,13 +9,21 @@ Two configurations (selected with --leads):
     --leads lead1   -> input = lead I only            (in_channels=1)
     --leads all12   -> input = all 12 leads           (in_channels=12)
 
+Sample rate (--target-fs) — we are optimising for Apple Watch input:
+    512  Apple Watch native; user data needs no resampling at all  (primary)
+    128  exact /4 of the watch rate; 4x shorter sequences          (ablation)
+    500  PTB-XL native, no resampling; the original baseline
+
+The label is in milliseconds and is therefore rate-independent — changing
+--target-fs changes the input length, never the target. See rates.py.
+
 Endpoint  : QT_Int_Global (ms), single scalar.
 Loss      : MSE.  Metrics: MSE, MAE, Pearson R (per epoch).
 Splits    : strat_fold <= 8 train, == 9 val.
 
 Usage:
-    python qt_finetune/train_resnet_qt.py --leads lead1 --epochs 40
-    python qt_finetune/train_resnet_qt.py --leads all12 --epochs 40
+    python qt_finetune/train_resnet_qt.py --leads lead1 --target-fs 512
+    python qt_finetune/train_resnet_qt.py --leads lead1 --target-fs 128
     python qt_finetune/train_resnet_qt.py --leads lead1 --smoke-test
 """
 from __future__ import annotations
@@ -50,6 +58,7 @@ for _p in (_MODELS_DIR, _SCRIPT_DIR):
 
 from ecg_resnet1d import ECGResNet1d
 from resnet_dataset import ResNetQTDataset
+from rates import DEFAULT_RATE, SUPPORTED_RATES, describe, window_len
 
 DEFAULT_LABELS = _SCRIPT_DIR / "qt_labels.csv"
 DEFAULT_OUTPUT = _SCRIPT_DIR / "checkpoints"
@@ -122,9 +131,12 @@ def run_epoch(model, loader, device, optimizer=None, desc=""):
 
 def smoke_test(args, device, lead_indices, derived, in_channels):
     print("=== Smoke test ===")
+    print(f"  {describe(args.target_fs)}")
     ds = ResNetQTDataset(args.ptbxl_dir, args.labels_csv, "train",
-                         lead_indices=lead_indices, derived=derived)
-    print(f"  Dataset: {len(ds)} samples,  in_channels={in_channels}")
+                         lead_indices=lead_indices, derived=derived,
+                         target_fs=args.target_fs)
+    print(f"  Dataset: {len(ds)} samples,  in_channels={in_channels},  "
+          f"expected L={window_len(args.target_fs)}")
     loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=0)
     x, qt = next(iter(loader))
     print(f"  Batch: x={tuple(x.shape)}  qt={tuple(qt.shape)}  qt={qt.flatten().tolist()}")
@@ -145,6 +157,10 @@ def main():
     parser.add_argument("--leads", choices=list(LEAD_CONFIGS), required=True,
                         help="lead1 (Lead I), all12 (all 12 leads), "
                              "or icm (derived V3-V2 single lead)")
+    parser.add_argument("--target-fs", type=int, default=DEFAULT_RATE,
+                        choices=list(SUPPORTED_RATES),
+                        help="input sample rate (Hz). 512 = Apple Watch native, "
+                             "128 = exact /4 of it, 500 = PTB-XL native baseline")
     parser.add_argument("--ptbxl-dir", default=str(DEFAULT_SIGNALS_DIR))
     parser.add_argument("--labels-csv", default=str(DEFAULT_LABELS))
     parser.add_argument("--epochs", type=int, default=40)
@@ -175,6 +191,7 @@ def main():
               torch.device("cpu"))
     print(f"Device: {device}   leads={args.leads} "
           f"(indices={lead_indices}, derived={derived}, in_channels={in_channels})")
+    print(f"Rate  : {describe(args.target_fs)}")
 
     if args.smoke_test:
         smoke_test(args, device, lead_indices, derived, in_channels)
@@ -182,14 +199,19 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_name = args.ckpt_name or f"best_resnet_{args.leads}.pt"
+    # Rate is always in the filename so runs at different rates never collide
+    # (and never overwrite the original 500 Hz checkpoints).
+    ckpt_name = args.ckpt_name or f"best_resnet_{args.leads}_{args.target_fs}hz.pt"
 
     print("Building datasets ...")
     train_ds = ResNetQTDataset(args.ptbxl_dir, args.labels_csv, "train",
-                               lead_indices=lead_indices, derived=derived)
+                               lead_indices=lead_indices, derived=derived,
+                               target_fs=args.target_fs)
     val_ds = ResNetQTDataset(args.ptbxl_dir, args.labels_csv, "val",
-                             lead_indices=lead_indices, derived=derived)
-    print(f"  Train: {len(train_ds)}   Val: {len(val_ds)}")
+                             lead_indices=lead_indices, derived=derived,
+                             target_fs=args.target_fs)
+    print(f"  Train: {len(train_ds)}   Val: {len(val_ds)}   "
+          f"input L={window_len(args.target_fs)}")
 
     pin = device.type == "cuda"
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
@@ -208,7 +230,7 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # ── W&B init ──────────────────────────────────────────────────────────
-    run_name = args.run_name or f"resnet_{args.leads}"
+    run_name = args.run_name or f"resnet_{args.leads}_{args.target_fs}hz"
     _wb = None
     if not args.no_wandb and _WANDB_OK and os.environ.get("WANDB_API_KEY"):
         import wandb
@@ -220,6 +242,9 @@ def main():
                 "model": "resnet18_1d",
                 "leads": args.leads,
                 "in_channels": in_channels,
+                "target_fs": args.target_fs,
+                "input_len": window_len(args.target_fs),
+                "target": "QT_Int_Global_ms",
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
                 "lr": args.lr,
@@ -257,6 +282,8 @@ def main():
                 "val_mae": va_mae, "val_mse": va_mse, "val_r": va_r,
                 "leads": args.leads, "lead_indices": lead_indices,
                 "derived": derived, "in_channels": in_channels,
+                "target_fs": args.target_fs,
+                "input_len": window_len(args.target_fs),
                 "args": vars(args),
             }, output_dir / ckpt_name)
         else:
