@@ -4,3 +4,8 @@ __pycache__/
 .DS_Store
 qt_finetune/results/
 data/
+*.pt
+*.json  
+*.log
+*.csv   
+*.txt
