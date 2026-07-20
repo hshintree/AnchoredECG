@@ -297,48 +297,46 @@ function correctQt(qtMs, rrSec, formula) {
   return qtMs / Math.cbrt(rrSec);
 }
 
-function interpretQtc(qtcMs, sex) {
-  const rounded = Math.round(qtcMs);
-  const normalUpper = sex === "female" ? 460 : 450;
-  const borderlineLower = normalUpper + 1;
-  const sexLabel = sex === "female" ? "women" : "men";
+function interpretQtc(analysis) {
+  const point = Math.round(analysis.qtc);
+  const q95 = Math.round(analysis.qtcQ95Ms ?? analysis.qtcUpperMs ?? analysis.qtc);
+  const tier = q95 <= 435 ? "normal" : q95 <= 445 ? "monitor" : "refer";
+  const margin = tier === "normal" ? 18 : tier === "monitor" ? 54 : 61;
+  const lower = point - margin;
+  const upper = point + margin;
 
-  if (rounded < 390) {
-    return {
-      level: "abnormal",
-      title: "Abnormally short QTc",
-      text: `${rounded} ms is below 390 ms, which is outside the reference range for both adult groups. This is not a diagnosis; confirm with a clinician-grade ECG.`,
-    };
-  }
-
-  if (rounded <= normalUpper) {
+  if (tier === "normal") {
     return {
       level: "normal",
-      title: "QTc in normal range",
-      text: `${rounded} ms is within the selected adult ${sexLabel} range of <= ${normalUpper} ms.`,
+      tier,
+      margin,
+      lower,
+      upper,
+      title: "Normal range",
+      text: `QTc is ${point} +/- ${margin} ms [${lower}-${upper}]. The model q95 bound is ${q95} ms, which is within the normal tier.`,
     };
   }
 
-  if (rounded <= 480) {
+  if (tier === "monitor") {
     return {
-      level: "abnormal",
-      title: "Borderline QTc",
-      text: `${rounded} ms is in the borderline range for adult ${sexLabel}: ${borderlineLower}-480 ms.`,
-    };
-  }
-
-  if (rounded > 500) {
-    return {
-      level: "abnormal",
-      title: "Prolonged QTc",
-      text: `${rounded} ms is above 500 ms, a range associated with higher risk and needing clinical review.`,
+      level: "monitor",
+      tier,
+      margin,
+      lower,
+      upper,
+      title: "Monitor range",
+      text: `QTc is ${point} +/- ${margin} ms [${lower}-${upper}]. The point estimate may look normal, but the q95 bound is ${q95} ms; repeat or monitor.`,
     };
   }
 
   return {
     level: "abnormal",
-    title: "Elevated QTc",
-    text: `${rounded} ms is above the borderline range and below 500 ms. This should be reviewed on a clinician-grade ECG.`,
+    tier,
+    margin,
+    lower,
+    upper,
+    title: upper > 500 ? "Refer range; severe threshold possible" : "Refer range",
+    text: `QTc is ${point} +/- ${margin} ms [${lower}-${upper}]. The q95 bound is ${q95} ms, above the referral boundary of 445 ms.`,
   };
 }
 
@@ -374,7 +372,7 @@ function qualityGrade(peaks, values, fs, landmarks, qtMs) {
 function renderAnalysis(analysis) {
   currentAnalysis = analysis;
   const formulaName = els.formulaSelect.selectedOptions[0].textContent;
-  const interpretation = interpretQtc(analysis.qtc, els.sexSelect.value);
+  const interpretation = interpretQtc(analysis);
   els.fileName.textContent = analysis.name;
   els.fileMeta.textContent = `${analysis.sampleCount.toLocaleString()} samples · ${analysis.fs.toFixed(0)} Hz · ${analysis.duration.toFixed(1)} s`;
   els.statusTitle.textContent = analysis.source === "ml" ? "ML QT interval estimated" : "QT interval estimated";
@@ -383,12 +381,12 @@ function renderAnalysis(analysis) {
   els.qtValue.textContent = Math.round(analysis.qtMs);
   els.qtSub.textContent = analysis.source === "ml" ? "ML median, milliseconds" : "milliseconds";
   els.qtcValue.textContent = Math.round(analysis.qtc);
-  els.qtcSub.textContent = `${formulaName} QTc`;
+  els.qtcSub.textContent = `${formulaName} QTc +/- ${interpretation.margin} ms`;
   els.qtcCard.className = `metric-card accent-qtc ${interpretation.level}`;
   els.hrValue.textContent = Math.round(analysis.hr);
   els.modelName.textContent = analysis.source === "ml" ? analysis.modelName : "Heuristic fallback";
   els.modelMeta.textContent = analysis.source === "ml"
-    ? `${analysis.modelMeta} · QT interval ${Math.round(analysis.qtLowerMs)}-${Math.round(analysis.qtUpperMs)} ms`
+    ? `${analysis.modelMeta} · QTc range ${interpretation.lower}-${interpretation.upper} ms`
     : "Browser-only estimate; start the local ML server for checkpoint inference.";
   els.intervalCard.className = `interval-card ${interpretation.level}`;
   els.intervalTitle.textContent = interpretation.title;
@@ -756,6 +754,8 @@ function analysisFromMl(payload, fallbackName) {
     qtLowerMs: payload.qtLowerMs,
     qtUpperMs: payload.qtUpperMs,
     qtc: correctQt(payload.qtMs, rrSec, els.formulaSelect.value),
+    qtcQ05Ms: correctQt(payload.qtLowerMs, rrSec, els.formulaSelect.value),
+    qtcQ95Ms: correctQt(payload.qtUpperMs, rrSec, els.formulaSelect.value),
     rrSec,
     quality: {
       level: "good",
@@ -796,6 +796,12 @@ els.clearButton.addEventListener("click", clearAnalysis);
 els.formulaSelect.addEventListener("change", () => {
   if (!currentAnalysis) return;
   currentAnalysis.qtc = correctQt(currentAnalysis.qtMs, currentAnalysis.rrSec, els.formulaSelect.value);
+  if (Number.isFinite(currentAnalysis.qtLowerMs)) {
+    currentAnalysis.qtcQ05Ms = correctQt(currentAnalysis.qtLowerMs, currentAnalysis.rrSec, els.formulaSelect.value);
+  }
+  if (Number.isFinite(currentAnalysis.qtUpperMs)) {
+    currentAnalysis.qtcQ95Ms = correctQt(currentAnalysis.qtUpperMs, currentAnalysis.rrSec, els.formulaSelect.value);
+  }
   renderAnalysis(currentAnalysis);
 });
 els.sexSelect.addEventListener("change", () => {
