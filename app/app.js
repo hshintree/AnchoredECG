@@ -22,6 +22,8 @@ const els = {
   intervalText: document.getElementById("intervalText"),
   qualityTitle: document.getElementById("qualityTitle"),
   qualityText: document.getElementById("qualityText"),
+  geminiTitle: document.getElementById("geminiTitle"),
+  geminiText: document.getElementById("geminiText"),
   rPeaks: document.getElementById("rPeaks"),
   qOnset: document.getElementById("qOnset"),
   tEnd: document.getElementById("tEnd"),
@@ -393,6 +395,8 @@ function renderAnalysis(analysis) {
   els.intervalText.textContent = interpretation.text;
   els.qualityTitle.textContent = analysis.quality.title;
   els.qualityText.textContent = analysis.quality.text;
+  els.geminiTitle.textContent = analysis.geminiSummary ? "Generated with Gemini" : "Gemini unavailable";
+  els.geminiText.textContent = analysis.geminiSummary || "No Gemini summary was returned for this inference.";
   els.rPeaks.textContent = analysis.peaks.length;
   els.qOnset.textContent = formatRelativeMs((analysis.landmarks.qOnset - analysis.landmarks.r) * 1000 / analysis.fs);
   els.tEnd.textContent = formatRelativeMs((analysis.landmarks.tEnd - analysis.landmarks.r) * 1000 / analysis.fs);
@@ -556,18 +560,22 @@ function drawQtBracket(ctx, qX, tX, y, label) {
   ctx.fillText(label, (qX + tX) / 2, y - 12);
 }
 
-function loadText(text, name) {
+function loadFile(file) {
   els.modelName.textContent = "Checking ML server...";
   els.modelMeta.textContent = "Trying the 128 Hz checkpoint path.";
   els.statusTitle.textContent = "Running ML inference";
   els.qualityPill.textContent = "ML pending";
   els.qualityPill.className = "quality-pill";
-  els.fileName.textContent = name;
-  els.fileMeta.textContent = "Waiting for the local checkpoint server.";
+  els.fileName.textContent = file.name;
+  els.fileMeta.textContent = "Waiting for the checkpoint server.";
 
-  requestMlInference(text, name)
-    .then((payload) => renderAnalysis(analysisFromMl(payload, name)))
+  requestMlInference(file)
+    .then((payload) => renderAnalysis(analysisFromMl(payload, file.name)))
     .catch((error) => showError(`ML server unavailable: ${error.message}`));
+}
+
+function loadText(text, name) {
+  loadFile(new File([text], name, { type: "text/plain" }));
 }
 
 function showError(message) {
@@ -580,6 +588,8 @@ function showError(message) {
   els.modelMeta.textContent = "Check the deployed service logs, then retry the upload.";
   els.qualityTitle.textContent = "No ML result";
   els.qualityText.textContent = message;
+  els.geminiTitle.textContent = "No summary";
+  els.geminiText.textContent = "Gemini summary requires a successful ML inference result.";
   els.qtValue.textContent = "--";
   els.qtcCard.className = "metric-card accent-qtc";
   els.qtcValue.textContent = "--";
@@ -613,6 +623,8 @@ function clearAnalysis() {
   els.intervalText.textContent = "Upload an ECG to compare QTc with the selected adult range.";
   els.qualityTitle.textContent = "No ECG loaded";
   els.qualityText.textContent = "Upload a waveform or load the demo ECG.";
+  els.geminiTitle.textContent = "Awaiting inference";
+  els.geminiText.textContent = "Upload an ECG to generate a concise non-diagnostic summary.";
   els.rPeaks.textContent = "--";
   els.qOnset.textContent = "--";
   els.tEnd.textContent = "--";
@@ -693,12 +705,12 @@ function formatRelativeMs(value) {
   return "at R";
 }
 
-async function requestMlInference(text, name) {
+async function requestMlInference(file) {
   const endpoints = endpointCandidates();
   let lastError = "";
   for (const endpoint of endpoints) {
     const form = new FormData();
-    form.append("file", new Blob([text], { type: "text/plain" }), name);
+    form.append("file", file, file.name);
     try {
       const response = await fetch(endpoint, { method: "POST", body: form });
       const payload = await response.json();
@@ -762,6 +774,7 @@ function analysisFromMl(payload, fallbackName) {
       title: "ML checkpoint inference",
       text: `QT was predicted by the 128 Hz lead-I ResNet checkpoint across ${payload.windows.length} ten-second windows.`,
     },
+    geminiSummary: payload.geminiSummary || "",
     mlWindows: payload.windows,
   };
 }
@@ -769,8 +782,7 @@ function analysisFromMl(payload, fallbackName) {
 els.fileInput.addEventListener("change", () => {
   const file = els.fileInput.files[0];
   if (!file) return;
-  els.fileName.textContent = file.name;
-  file.text().then((text) => loadText(text, file.name));
+  loadFile(file);
 });
 
 els.dropzone.addEventListener("dragover", (event) => {
@@ -787,8 +799,7 @@ els.dropzone.addEventListener("drop", (event) => {
   els.dropzone.classList.remove("is-dragging");
   const file = event.dataTransfer.files[0];
   if (!file) return;
-  els.fileName.textContent = file.name;
-  file.text().then((text) => loadText(text, file.name));
+  loadFile(file);
 });
 
 els.demoButton.addEventListener("click", () => loadText(demoCsv(), "Demo synthetic ECG.csv"));
