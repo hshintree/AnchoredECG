@@ -579,7 +579,7 @@ function showError(message) {
   els.qualityPill.className = "quality-pill poor";
   els.fileMeta.textContent = message;
   els.modelName.textContent = "Inference unavailable";
-  els.modelMeta.textContent = "Start the local server and retry the upload.";
+  els.modelMeta.textContent = "Check the deployed service logs, then retry the upload.";
   els.qualityTitle.textContent = "No ML result";
   els.qualityText.textContent = message;
   els.qtValue.textContent = "--";
@@ -716,7 +716,10 @@ async function requestMlInference(text, name) {
 function endpointCandidates() {
   const localPorts = Array.from({ length: 20 }, (_, index) => `http://127.0.0.1:${8000 + index}/api/infer`);
   if (location.protocol === "file:") return localPorts;
-  return ["/api/infer", ...localPorts];
+  if (location.hostname === "127.0.0.1" || location.hostname === "localhost") {
+    return ["/api/infer", ...localPorts];
+  }
+  return ["/api/infer"];
 }
 
 function analysisFromMl(payload, fallbackName) {
