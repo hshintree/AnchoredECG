@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import cgi
 import json
+import os
 import re
 import sys
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import error, request
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -230,7 +232,7 @@ def _run_inference(signal_uv: np.ndarray, native_fs: int, meta: dict,
     qt_ms = float(np.median(point))
     rr_sec, hr, peaks = estimate_rr(x_mv, TARGET_FS)
 
-    return {
+    payload = {
         "source": "ml",
         "filename": filename,
         "polarityFlipped": bool(polarity_flipped),
@@ -262,6 +264,84 @@ def _run_inference(signal_uv: np.ndarray, native_fs: int, meta: dict,
         "peaks": peaks[:80],
         "meta": {k: str(v) for k, v in meta.items()},
     }
+    payload["geminiSummary"] = gemini_clinical_summary(payload)
+    return payload
+
+
+def corrected_qt_fridericia(qt_ms: float, rr_sec: float | None) -> float | None:
+    if not rr_sec or rr_sec <= 0:
+        return None
+    return float(qt_ms / (rr_sec ** (1.0 / 3.0)))
+
+
+def qtc_tier(qtc_upper_ms: float | None) -> str:
+    if qtc_upper_ms is None:
+        return "unknown"
+    if qtc_upper_ms <= 435:
+        return "normal"
+    if qtc_upper_ms <= 445:
+        return "monitor"
+    return "refer"
+
+
+def fallback_clinical_summary(payload: dict) -> str:
+    qtc = corrected_qt_fridericia(payload["qtMs"], payload.get("rrSec"))
+    upper = corrected_qt_fridericia(payload["qtUpperMs"], payload.get("rrSec"))
+    if qtc is None:
+        return "Gemini summary unavailable because a stable RR interval could not be estimated."
+    tier = qtc_tier(upper)
+    tier_text = {"normal": "normal-range", "monitor": "monitor-range", "refer": "referral-range"}.get(
+        tier, "unclassified"
+    )
+    hr_text = f", average HR {payload['hr']:.0f} bpm" if payload.get("hr") else ""
+    return (
+        f"Single-lead Apple Watch ECG, {payload['duration']:.0f} seconds{hr_text}. "
+        f"Estimated Fridericia QTc is {qtc:.0f} ms with a {tier_text} flag. "
+        "Research preview only; not a diagnostic QT measurement."
+    )
+
+
+def gemini_clinical_summary(payload: dict) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    fallback = fallback_clinical_summary(payload)
+    if not api_key:
+        return fallback
+
+    qtc = corrected_qt_fridericia(payload["qtMs"], payload.get("rrSec"))
+    lower = corrected_qt_fridericia(payload["qtLowerMs"], payload.get("rrSec"))
+    upper = corrected_qt_fridericia(payload["qtUpperMs"], payload.get("rrSec"))
+    tier = qtc_tier(upper)
+    hr_text = f"{payload['hr']:.0f} bpm" if payload.get("hr") else "not available"
+    qtc_text = f"{qtc:.0f} ms" if qtc is not None else "not available"
+    range_text = f"{lower:.0f}-{upper:.0f} ms" if lower is not None and upper is not None else "not available"
+    prompt = (
+        "Write one concise, non-diagnostic clinical-style summary for a wearable ECG research prototype. "
+        "Do not give medical advice. Include that this is a single-lead Apple Watch ECG research preview. "
+        "Use cautious language and mention clinician review for monitor or referral range. "
+        f"Duration: {payload['duration']:.1f} seconds. "
+        f"Heart rate: {hr_text}. "
+        f"QT interval: {payload['qtMs']:.0f} ms. "
+        f"Fridericia QTc: {qtc_text}. "
+        f"Model interval: {range_text}. "
+        f"Risk tier: {tier}. "
+        f"Model: {payload['model']}."
+    )
+    body = json.dumps(
+        {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 120},
+        }
+    ).encode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    req = request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        parts = data["candidates"][0]["content"]["parts"]
+        text = " ".join(part.get("text", "") for part in parts).strip()
+        return text or fallback
+    except (KeyError, IndexError, TimeoutError, OSError, error.URLError, error.HTTPError, json.JSONDecodeError):
+        return fallback
 
 
 def estimate_rr(x: np.ndarray, fs: int) -> tuple[float | None, float | None, list[int]]:
@@ -354,7 +434,7 @@ def main() -> None:
 
 
 def parse_host_port() -> tuple[str, int]:
-    host, port = "127.0.0.1", 8000
+    host, port = "127.0.0.1", int(os.environ.get("PORT", "8000"))
     args = sys.argv[1:]
     for i, arg in enumerate(args):
         if arg == "--host" and i + 1 < len(args):
@@ -383,3 +463,4 @@ def bind_server(host: str, port: int) -> ThreadingHTTPServer:
 
 if __name__ == "__main__":
     main()
+

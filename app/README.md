@@ -19,11 +19,11 @@ Opening `index.html` directly still works, but it uses the browser-only heuristi
 
 The waveform display is formatted as three 10-second ECG strips, matching the current recording format used in this repo.
 
-QTc interpretation uses the selected adult range:
+QTc interpretation uses the model's upper q95 bound and a tier-specific disclosure interval:
 
-- Men: normal <= 450 ms, borderline 451-480 ms.
-- Women: normal <= 460 ms, borderline 461-480 ms.
-- Both: abnormally short < 390 ms; QTc above 500 ms is flagged as prolonged.
+- Normal: q95 <= 435 ms, shown as QTc +/- 18 ms.
+- Monitor: q95 435-445 ms, shown as QTc +/- 54 ms.
+- Refer: q95 > 445 ms, shown as QTc +/- 61 ms.
 
 ## Supported Uploads
 

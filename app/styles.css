@@ -332,6 +332,12 @@ select {
   background: var(--normal-bg);
 }
 
+.metric-card.monitor {
+  border-color: #f3d69c;
+  border-top-color: var(--amber);
+  background: #fff8e8;
+}
+
 .metric-card.abnormal {
   border-color: #f0c3bc;
   border-top-color: var(--danger);
@@ -434,6 +440,15 @@ canvas {
 
 .interval-card.normal h4 {
   color: var(--normal);
+}
+
+.interval-card.monitor {
+  border-color: #f3d69c;
+  background: #fff8e8;
+}
+
+.interval-card.monitor h4 {
+  color: var(--amber);
 }
 
 .interval-card.abnormal {

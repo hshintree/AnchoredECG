@@ -22,6 +22,8 @@ const els = {
   intervalText: document.getElementById("intervalText"),
   qualityTitle: document.getElementById("qualityTitle"),
   qualityText: document.getElementById("qualityText"),
+  geminiTitle: document.getElementById("geminiTitle"),
+  geminiText: document.getElementById("geminiText"),
   rPeaks: document.getElementById("rPeaks"),
   qOnset: document.getElementById("qOnset"),
   tEnd: document.getElementById("tEnd"),
@@ -297,48 +299,46 @@ function correctQt(qtMs, rrSec, formula) {
   return qtMs / Math.cbrt(rrSec);
 }
 
-function interpretQtc(qtcMs, sex) {
-  const rounded = Math.round(qtcMs);
-  const normalUpper = sex === "female" ? 460 : 450;
-  const borderlineLower = normalUpper + 1;
-  const sexLabel = sex === "female" ? "women" : "men";
+function interpretQtc(analysis) {
+  const point = Math.round(analysis.qtc);
+  const q95 = Math.round(analysis.qtcQ95Ms ?? analysis.qtcUpperMs ?? analysis.qtc);
+  const tier = q95 <= 435 ? "normal" : q95 <= 445 ? "monitor" : "refer";
+  const margin = tier === "normal" ? 18 : tier === "monitor" ? 54 : 61;
+  const lower = point - margin;
+  const upper = point + margin;
 
-  if (rounded < 390) {
-    return {
-      level: "abnormal",
-      title: "Abnormally short QTc",
-      text: `${rounded} ms is below 390 ms, which is outside the reference range for both adult groups. This is not a diagnosis; confirm with a clinician-grade ECG.`,
-    };
-  }
-
-  if (rounded <= normalUpper) {
+  if (tier === "normal") {
     return {
       level: "normal",
-      title: "QTc in normal range",
-      text: `${rounded} ms is within the selected adult ${sexLabel} range of <= ${normalUpper} ms.`,
+      tier,
+      margin,
+      lower,
+      upper,
+      title: "Normal range",
+      text: `QTc is ${point} +/- ${margin} ms [${lower}-${upper}]. The model q95 bound is ${q95} ms, which is within the normal tier.`,
     };
   }
 
-  if (rounded <= 480) {
+  if (tier === "monitor") {
     return {
-      level: "abnormal",
-      title: "Borderline QTc",
-      text: `${rounded} ms is in the borderline range for adult ${sexLabel}: ${borderlineLower}-480 ms.`,
-    };
-  }
-
-  if (rounded > 500) {
-    return {
-      level: "abnormal",
-      title: "Prolonged QTc",
-      text: `${rounded} ms is above 500 ms, a range associated with higher risk and needing clinical review.`,
+      level: "monitor",
+      tier,
+      margin,
+      lower,
+      upper,
+      title: "Monitor range",
+      text: `QTc is ${point} +/- ${margin} ms [${lower}-${upper}]. The point estimate may look normal, but the q95 bound is ${q95} ms; repeat or monitor.`,
     };
   }
 
   return {
     level: "abnormal",
-    title: "Elevated QTc",
-    text: `${rounded} ms is above the borderline range and below 500 ms. This should be reviewed on a clinician-grade ECG.`,
+    tier,
+    margin,
+    lower,
+    upper,
+    title: upper > 500 ? "Refer range; severe threshold possible" : "Refer range",
+    text: `QTc is ${point} +/- ${margin} ms [${lower}-${upper}]. The q95 bound is ${q95} ms, above the referral boundary of 445 ms.`,
   };
 }
 
@@ -374,7 +374,7 @@ function qualityGrade(peaks, values, fs, landmarks, qtMs) {
 function renderAnalysis(analysis) {
   currentAnalysis = analysis;
   const formulaName = els.formulaSelect.selectedOptions[0].textContent;
-  const interpretation = interpretQtc(analysis.qtc, els.sexSelect.value);
+  const interpretation = interpretQtc(analysis);
   els.fileName.textContent = analysis.name;
   els.fileMeta.textContent = `${analysis.sampleCount.toLocaleString()} samples · ${analysis.fs.toFixed(0)} Hz · ${analysis.duration.toFixed(1)} s`;
   els.statusTitle.textContent = analysis.source === "ml" ? "ML QT interval estimated" : "QT interval estimated";
@@ -383,18 +383,20 @@ function renderAnalysis(analysis) {
   els.qtValue.textContent = Math.round(analysis.qtMs);
   els.qtSub.textContent = analysis.source === "ml" ? "ML median, milliseconds" : "milliseconds";
   els.qtcValue.textContent = Math.round(analysis.qtc);
-  els.qtcSub.textContent = `${formulaName} QTc`;
+  els.qtcSub.textContent = `${formulaName} QTc +/- ${interpretation.margin} ms`;
   els.qtcCard.className = `metric-card accent-qtc ${interpretation.level}`;
   els.hrValue.textContent = Math.round(analysis.hr);
   els.modelName.textContent = analysis.source === "ml" ? analysis.modelName : "Heuristic fallback";
   els.modelMeta.textContent = analysis.source === "ml"
-    ? `${analysis.modelMeta} · QT interval ${Math.round(analysis.qtLowerMs)}-${Math.round(analysis.qtUpperMs)} ms`
+    ? `${analysis.modelMeta} · QTc range ${interpretation.lower}-${interpretation.upper} ms`
     : "Browser-only estimate; start the local ML server for checkpoint inference.";
   els.intervalCard.className = `interval-card ${interpretation.level}`;
   els.intervalTitle.textContent = interpretation.title;
   els.intervalText.textContent = interpretation.text;
   els.qualityTitle.textContent = analysis.quality.title;
   els.qualityText.textContent = analysis.quality.text;
+  els.geminiTitle.textContent = analysis.geminiSummary ? "Generated with Gemini" : "Gemini unavailable";
+  els.geminiText.textContent = analysis.geminiSummary || "No Gemini summary was returned for this inference.";
   els.rPeaks.textContent = analysis.peaks.length;
   els.qOnset.textContent = formatRelativeMs((analysis.landmarks.qOnset - analysis.landmarks.r) * 1000 / analysis.fs);
   els.tEnd.textContent = formatRelativeMs((analysis.landmarks.tEnd - analysis.landmarks.r) * 1000 / analysis.fs);
@@ -558,34 +560,22 @@ function drawQtBracket(ctx, qX, tX, y, label) {
   ctx.fillText(label, (qX + tX) / 2, y - 12);
 }
 
-function beginInference(name) {
+function loadFile(file) {
   els.modelName.textContent = "Checking ML server...";
   els.modelMeta.textContent = "Trying the 128 Hz checkpoint path.";
   els.statusTitle.textContent = "Running ML inference";
   els.qualityPill.textContent = "ML pending";
   els.qualityPill.className = "quality-pill";
-  els.fileName.textContent = name;
-  els.fileMeta.textContent = "Waiting for the local checkpoint server.";
-}
+  els.fileName.textContent = file.name;
+  els.fileMeta.textContent = "Waiting for the checkpoint server.";
 
-function runInference(payload, name) {
-  requestMlInference(payload, name)
-    .then((result) => renderAnalysis(analysisFromMl(result, name)))
+  requestMlInference(file)
+    .then((payload) => renderAnalysis(analysisFromMl(payload, file.name)))
     .catch((error) => showError(`ML server unavailable: ${error.message}`));
 }
 
-// Text entry point (used by the in-page demo, which generates a CSV string).
 function loadText(text, name) {
-  beginInference(name);
-  runInference(text, name);
-}
-
-// File entry point (uploads and drops). Sends the raw File so binary formats
-// such as the Apple Health PDF survive intact — the server decides how to parse
-// it from the bytes, so no client-side format handling is needed.
-function loadFile(file) {
-  beginInference(file.name);
-  runInference(file, file.name);
+  loadFile(new File([text], name, { type: "text/plain" }));
 }
 
 function showError(message) {
@@ -598,6 +588,8 @@ function showError(message) {
   els.modelMeta.textContent = "Check the deployed service logs, then retry the upload.";
   els.qualityTitle.textContent = "No ML result";
   els.qualityText.textContent = message;
+  els.geminiTitle.textContent = "No summary";
+  els.geminiText.textContent = "Gemini summary requires a successful ML inference result.";
   els.qtValue.textContent = "--";
   els.qtcCard.className = "metric-card accent-qtc";
   els.qtcValue.textContent = "--";
@@ -631,6 +623,8 @@ function clearAnalysis() {
   els.intervalText.textContent = "Upload an ECG to compare QTc with the selected adult range.";
   els.qualityTitle.textContent = "No ECG loaded";
   els.qualityText.textContent = "Upload a waveform or load the demo ECG.";
+  els.geminiTitle.textContent = "Awaiting inference";
+  els.geminiText.textContent = "Upload an ECG to generate a concise non-diagnostic summary.";
   els.rPeaks.textContent = "--";
   els.qOnset.textContent = "--";
   els.tEnd.textContent = "--";
@@ -711,18 +705,12 @@ function formatRelativeMs(value) {
   return "at R";
 }
 
-async function requestMlInference(payload, name) {
-  // `payload` may be a File/Blob (raw upload, e.g. a PDF whose bytes must be
-  // preserved) or a string (the demo CSV, generated in-page).
-  const body =
-    payload instanceof Blob
-      ? payload
-      : new Blob([payload], { type: "text/plain" });
+async function requestMlInference(file) {
   const endpoints = endpointCandidates();
   let lastError = "";
   for (const endpoint of endpoints) {
     const form = new FormData();
-    form.append("file", body, name);
+    form.append("file", file, file.name);
     try {
       const response = await fetch(endpoint, { method: "POST", body: form });
       const payload = await response.json();
@@ -778,12 +766,15 @@ function analysisFromMl(payload, fallbackName) {
     qtLowerMs: payload.qtLowerMs,
     qtUpperMs: payload.qtUpperMs,
     qtc: correctQt(payload.qtMs, rrSec, els.formulaSelect.value),
+    qtcQ05Ms: correctQt(payload.qtLowerMs, rrSec, els.formulaSelect.value),
+    qtcQ95Ms: correctQt(payload.qtUpperMs, rrSec, els.formulaSelect.value),
     rrSec,
     quality: {
       level: "good",
       title: "ML checkpoint inference",
       text: `QT was predicted by the 128 Hz lead-I ResNet checkpoint across ${payload.windows.length} ten-second windows.`,
     },
+    geminiSummary: payload.geminiSummary || "",
     mlWindows: payload.windows,
   };
 }
@@ -816,6 +807,12 @@ els.clearButton.addEventListener("click", clearAnalysis);
 els.formulaSelect.addEventListener("change", () => {
   if (!currentAnalysis) return;
   currentAnalysis.qtc = correctQt(currentAnalysis.qtMs, currentAnalysis.rrSec, els.formulaSelect.value);
+  if (Number.isFinite(currentAnalysis.qtLowerMs)) {
+    currentAnalysis.qtcQ05Ms = correctQt(currentAnalysis.qtLowerMs, currentAnalysis.rrSec, els.formulaSelect.value);
+  }
+  if (Number.isFinite(currentAnalysis.qtUpperMs)) {
+    currentAnalysis.qtcQ95Ms = correctQt(currentAnalysis.qtUpperMs, currentAnalysis.rrSec, els.formulaSelect.value);
+  }
   renderAnalysis(currentAnalysis);
 });
 els.sexSelect.addEventListener("change", () => {
