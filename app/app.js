@@ -558,7 +558,7 @@ function drawQtBracket(ctx, qX, tX, y, label) {
   ctx.fillText(label, (qX + tX) / 2, y - 12);
 }
 
-function loadText(text, name) {
+function beginInference(name) {
   els.modelName.textContent = "Checking ML server...";
   els.modelMeta.textContent = "Trying the 128 Hz checkpoint path.";
   els.statusTitle.textContent = "Running ML inference";
@@ -566,10 +566,26 @@ function loadText(text, name) {
   els.qualityPill.className = "quality-pill";
   els.fileName.textContent = name;
   els.fileMeta.textContent = "Waiting for the local checkpoint server.";
+}
 
-  requestMlInference(text, name)
-    .then((payload) => renderAnalysis(analysisFromMl(payload, name)))
+function runInference(payload, name) {
+  requestMlInference(payload, name)
+    .then((result) => renderAnalysis(analysisFromMl(result, name)))
     .catch((error) => showError(`ML server unavailable: ${error.message}`));
+}
+
+// Text entry point (used by the in-page demo, which generates a CSV string).
+function loadText(text, name) {
+  beginInference(name);
+  runInference(text, name);
+}
+
+// File entry point (uploads and drops). Sends the raw File so binary formats
+// such as the Apple Health PDF survive intact — the server decides how to parse
+// it from the bytes, so no client-side format handling is needed.
+function loadFile(file) {
+  beginInference(file.name);
+  runInference(file, file.name);
 }
 
 function showError(message) {
@@ -695,12 +711,18 @@ function formatRelativeMs(value) {
   return "at R";
 }
 
-async function requestMlInference(text, name) {
+async function requestMlInference(payload, name) {
+  // `payload` may be a File/Blob (raw upload, e.g. a PDF whose bytes must be
+  // preserved) or a string (the demo CSV, generated in-page).
+  const body =
+    payload instanceof Blob
+      ? payload
+      : new Blob([payload], { type: "text/plain" });
   const endpoints = endpointCandidates();
   let lastError = "";
   for (const endpoint of endpoints) {
     const form = new FormData();
-    form.append("file", new Blob([text], { type: "text/plain" }), name);
+    form.append("file", body, name);
     try {
       const response = await fetch(endpoint, { method: "POST", body: form });
       const payload = await response.json();
@@ -769,8 +791,7 @@ function analysisFromMl(payload, fallbackName) {
 els.fileInput.addEventListener("change", () => {
   const file = els.fileInput.files[0];
   if (!file) return;
-  els.fileName.textContent = file.name;
-  file.text().then((text) => loadText(text, file.name));
+  loadFile(file);
 });
 
 els.dropzone.addEventListener("dragover", (event) => {
@@ -787,8 +808,7 @@ els.dropzone.addEventListener("drop", (event) => {
   els.dropzone.classList.remove("is-dragging");
   const file = event.dataTransfer.files[0];
   if (!file) return;
-  els.fileName.textContent = file.name;
-  file.text().then((text) => loadText(text, file.name));
+  loadFile(file);
 });
 
 els.demoButton.addEventListener("click", () => loadText(demoCsv(), "Demo synthetic ECG.csv"));

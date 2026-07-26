@@ -137,22 +137,47 @@ def analyse(df: pd.DataFrame):
     g["d_pred"] = g.qtcf_pred - g.b_pred
     post = g[g.tpt > 0].copy()
 
-    # ---- Q2: does a personal baseline cancel the offset? -------------------
-    e_abs = np.abs(post.qtcf_pred - post.qtcf_true)
-    e_del = np.abs(post.d_pred - post.d_true)
+    # ---- Q2: what does a personal baseline actually buy? -------------------
+    # Three references, weakest to strongest:
+    #   (a) none            — absolute QTcF
+    #   (b) single pre-dose ECG in the same period
+    #   (c) pooled personal baseline: every pre-dose reading the subject has
+    #       (one per period). This is the wearable scenario — a baseline
+    #       established over days rather than from one recording.
+    pool = (g[g.tpt < 0].groupby("subject", as_index=False)
+              .agg(pb_true=("qtcf_true", "mean"), pb_pred=("qtcf_pred", "mean"),
+                   n_base=("qtcf_true", "size")))
+    post = post.merge(pool, on="subject", how="left")
+    sig = {
+        "absolute QTcF (no baseline)": post.qtcf_pred - post.qtcf_true,
+        "minus single pre-dose ECG": post.d_pred - post.d_true,
+        "minus pooled personal baseline":
+            (post.qtcf_pred - post.pb_pred) - (post.qtcf_true - post.pb_true),
+    }
     print("=" * 78)
-    print("Q2  Does differencing against a personal baseline remove the error?")
+    print("Q2  What does a personal baseline actually buy?")
     print("=" * 78)
-    print(f"  absolute QTcF        MAE {e_abs.mean():6.2f} ms   "
-          f"(bias {np.median(post.qtcf_pred - post.qtcf_true):+.1f})")
-    print(f"  change from baseline MAE {e_del.mean():6.2f} ms   "
-          f"(bias {np.median(post.d_pred - post.d_true):+.1f})")
-    print(f"  -> differencing removes {(1 - e_del.mean()/e_abs.mean())*100:.0f}% "
-          f"of the error")
-    bs = post.groupby("subject").apply(
-        lambda s: (s.qtcf_pred - s.qtcf_true).median(), include_groups=False)
-    print(f"  per-subject offset spread: SD {bs.std():.1f} ms over "
-          f"{len(bs)} subjects (this is what cancels)")
+    print(f"  {'reference used':<34} {'MAE':>7} {'bias':>7} {'SD':>7} {'vs abs':>8}")
+    base = None
+    for lab, s in sig.items():
+        mae = s.abs().mean()
+        base = mae if base is None else base
+        rel = "—" if lab.startswith("absolute") else f"{(1-mae/base)*100:+.0f}%"
+        print(f"  {lab:<34} {mae:>7.2f} {s.median():>+7.2f} {s.std():>7.2f} {rel:>8}")
+
+    # The diagnostic that matters: if the error were a fixed per-person offset,
+    # differencing would drive the per-subject spread toward zero. Check it.
+    off_abs = sig["absolute QTcF (no baseline)"].groupby(post.subject).median()
+    off_pool = sig["minus pooled personal baseline"].groupby(post.subject).median()
+    print(f"\n  per-subject offset SD: {off_abs.std():.2f} ms absolute  ->  "
+          f"{off_pool.std():.2f} ms after pooled differencing "
+          f"({post.subject.nunique()} subjects, median "
+          f"{pool.n_base.median():.0f} baseline readings each)")
+    if off_pool.std() > 0.6 * off_abs.std():
+        print("  NOTE: the per-subject component barely moves, so the error is NOT"
+              "\n        mainly a fixed personal offset. The MAE gain above comes from"
+              "\n        removing a GLOBAL bias, which a single recalibration constant"
+              "\n        would also achieve — a personal baseline is not required for it.")
 
     # ---- Q1: placebo-corrected effect, and the drug ordering ---------------
     pl = (post[post.drug == PLACEBO][["subject", "tpt", "d_true", "d_pred"]]

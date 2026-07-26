@@ -174,10 +174,48 @@ def load_model():
     return _MODEL, _OBJECTIVE, _CKPT_META
 
 
-def infer_qt(text: str, filename: str) -> dict:
-    import torch
+def parse_apple_pdf_bytes(data: bytes) -> tuple[np.ndarray, int, dict]:
+    """Recover the waveform from an Apple Health ECG PDF (vector trace)."""
+    import io
 
+    try:
+        from apple_pdf import read_apple_pdf
+    except ImportError as exc:  # pdfplumber missing
+        raise ValueError(
+            "PDF support needs pdfplumber. Install it with "
+            "`pip install pdfplumber` and restart the server."
+        ) from exc
+
+    # Polarity is corrected uniformly in _run_inference (covers text uploads
+    # too), so the loader must not also flip — that would double-correct.
+    ecg = read_apple_pdf(io.BytesIO(data), correct_polarity=False)
+    if ecg.signal_uv.size < 200:
+        raise ValueError("Could not recover a waveform from this PDF.")
+    meta = {str(k): str(v) for k, v in ecg.meta.items()}
+    return ecg.signal_uv.astype(np.float64), int(ecg.fs), meta
+
+
+def infer_qt(text: str, filename: str) -> dict:
     signal_uv, native_fs, meta = parse_apple_or_numeric_text(text)
+    return _run_inference(signal_uv, native_fs, meta, filename)
+
+
+def infer_qt_pdf(data: bytes, filename: str) -> dict:
+    signal_uv, native_fs, meta = parse_apple_pdf_bytes(data)
+    return _run_inference(signal_uv, native_fs, meta, filename)
+
+
+def _run_inference(signal_uv: np.ndarray, native_fs: int, meta: dict,
+                   filename: str) -> dict:
+    import torch
+    from apple_ecg import apply_qrs_polarity
+
+    # Match the model's upright training domain: an Apple Lead I recorded on the
+    # other wrist (or held reversed) has an inverted QRS, which is out of
+    # distribution for the amplitude features. Applies to both text and PDF.
+    signal_uv, polarity_flipped = apply_qrs_polarity(signal_uv, native_fs)
+    meta["polarity_flipped"] = str(polarity_flipped)
+
     x_mv = to_128hz_mv(signal_uv, native_fs)
     windows = windows_10s(x_mv)
     model, objective, ckpt = load_model()
@@ -195,6 +233,7 @@ def infer_qt(text: str, filename: str) -> dict:
     return {
         "source": "ml",
         "filename": filename,
+        "polarityFlipped": bool(polarity_flipped),
         "model": CHECKPOINT.name,
         "targetFs": TARGET_FS,
         "nativeFs": int(native_fs),
@@ -289,9 +328,17 @@ class Handler(SimpleHTTPRequestHandler):
             if field is None or not getattr(field, "file", None):
                 _json_error(self, 400, "Missing uploaded file.")
                 return
-            text = field.file.read().decode("utf-8", errors="replace")
+            raw = field.file.read()
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", errors="replace")
             filename = unquote(getattr(field, "filename", "") or "uploaded ECG")
-            _json_ok(self, infer_qt(text, filename))
+            # Route PDFs to the vector-trace parser; everything else is text.
+            is_pdf = raw[:5] == b"%PDF-" or filename.lower().endswith(".pdf")
+            if is_pdf:
+                _json_ok(self, infer_qt_pdf(raw, filename))
+            else:
+                _json_ok(self, infer_qt(raw.decode("utf-8", errors="replace"),
+                                        filename))
         except Exception as exc:
             _json_error(self, 500, str(exc))
 

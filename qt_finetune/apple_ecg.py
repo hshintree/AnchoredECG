@@ -58,11 +58,73 @@ def _is_metadata(line: str) -> bool:
     return any(c.isalpha() for c in key)
 
 
-def read_apple_ecg(path: str | Path) -> AppleECG:
+# --------------------------------------------------------------------------
+# QRS polarity
+# --------------------------------------------------------------------------
+# Apple's Lead I is wrist-to-contralateral-finger. Depending on which wrist the
+# watch is on and how it is held, the effective lead polarity can invert, giving
+# a predominantly *negative* QRS. PTB-XL Lead I (the training domain) is almost
+# always upright, so an inverted trace is out-of-distribution for the model's
+# amplitude features. We detect the dominant QRS direction and flip the trace to
+# match training. Numpy-only, so the lightweight loaders keep no scipy dep.
+
+def _dominant_beats(x: np.ndarray, fs: int) -> np.ndarray:
+    """Indices of the largest-magnitude deflection in each beat (QRS proxy).
+
+    Greedy windowed peak-pick: cross a high-amplitude threshold, take the
+    |max| within one refractory window, then skip ahead. No scipy.
+    """
+    absx = np.abs(x)
+    thr = np.percentile(absx, 90)
+    refr = max(1, int(0.28 * fs))
+    peaks, i, n = [], 0, len(x)
+    while i < n:
+        if absx[i] >= thr:
+            j = min(n, i + refr)
+            peaks.append(i + int(np.argmax(absx[i:j])))
+            i = peaks[-1] + refr
+        else:
+            i += 1
+    return np.asarray(peaks, dtype=int)
+
+
+def qrs_is_upright(signal: np.ndarray, fs: int) -> bool:
+    """True if the dominant QRS deflection points up (majority of beats).
+
+    Falls back to a global excursion test when too few beats are found, so it is
+    safe on short or noisy segments.
+    """
+    x = np.asarray(signal, dtype=float)
+    x = x - np.median(x)
+    if len(x) < int(0.5 * fs):
+        return True
+    beats = _dominant_beats(x, fs)
+    if len(beats) >= 3:
+        return float(np.median(x[beats])) >= 0.0
+    # fallback: is the biggest upward excursion at least as big as the downward?
+    return np.percentile(x, 99.5) >= -np.percentile(x, 0.5)
+
+
+def apply_qrs_polarity(signal: np.ndarray, fs: int) -> tuple[np.ndarray, bool]:
+    """Return (possibly-flipped signal, was_flipped).
+
+    Inversion negates the AC waveform about its own baseline (2*median - x), so
+    the deflections flip while the baseline level is preserved.
+    """
+    if qrs_is_upright(signal, fs):
+        return signal, False
+    med = float(np.median(signal))
+    return (2.0 * med - signal), True
+
+
+def read_apple_ecg(path: str | Path, correct_polarity: bool = True) -> AppleECG:
     """Parse an Apple Watch ECG export.
 
     Handles both decimal-comma and decimal-dot locales, and tolerates localised
     metadata keys (the sample rate is recovered by pattern, not by key name).
+
+    ``correct_polarity`` (default on) flips a predominantly-negative QRS to match
+    the model's upright training domain; ``meta['polarity_flipped']`` records it.
     """
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     meta, raw_lines = {}, []
@@ -107,6 +169,12 @@ def read_apple_ecg(path: str | Path) -> AppleECG:
         signal = signal * 1000.0
 
     meta.setdefault("_decimal_comma", str(decimal_comma))
+
+    flipped = False
+    if correct_polarity:
+        signal, flipped = apply_qrs_polarity(signal, fs)
+    meta["polarity_flipped"] = str(flipped)
+
     return AppleECG(signal_uv=signal, fs=fs, meta=meta)
 
 
