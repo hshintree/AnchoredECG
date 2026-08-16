@@ -207,10 +207,42 @@ def infer_qt_pdf(data: bytes, filename: str) -> dict:
     return _run_inference(signal_uv, native_fs, meta, filename)
 
 
+def _dominant_beats(x: np.ndarray, fs: int) -> np.ndarray:
+    absx = np.abs(x)
+    thr = np.percentile(absx, 90)
+    refr = max(1, int(0.28 * fs))
+    peaks, i, n = [], 0, len(x)
+    while i < n:
+        if absx[i] >= thr:
+            j = min(n, i + refr)
+            peaks.append(i + int(np.argmax(absx[i:j])))
+            i = peaks[-1] + refr
+        else:
+            i += 1
+    return np.asarray(peaks, dtype=int)
+
+
+def qrs_is_upright(signal: np.ndarray, fs: int) -> bool:
+    x = np.asarray(signal, dtype=float)
+    x = x - np.median(x)
+    if len(x) < int(0.5 * fs):
+        return True
+    beats = _dominant_beats(x, fs)
+    if len(beats) >= 3:
+        return float(np.median(x[beats])) >= 0.0
+    return np.percentile(x, 99.5) >= -np.percentile(x, 0.5)
+
+
+def apply_qrs_polarity(signal: np.ndarray, fs: int) -> tuple[np.ndarray, bool]:
+    if qrs_is_upright(signal, fs):
+        return signal, False
+    med = float(np.median(signal))
+    return (2.0 * med - signal), True
+
+
 def _run_inference(signal_uv: np.ndarray, native_fs: int, meta: dict,
                    filename: str) -> dict:
     import torch
-    from apple_ecg import apply_qrs_polarity
 
     # Match the model's upright training domain: an Apple Lead I recorded on the
     # other wrist (or held reversed) has an inverted QRS, which is out of
@@ -463,4 +495,3 @@ def bind_server(host: str, port: int) -> ThreadingHTTPServer:
 
 if __name__ == "__main__":
     main()
-

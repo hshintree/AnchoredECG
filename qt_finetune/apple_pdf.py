@@ -27,16 +27,66 @@ everything downstream (resampling, windowing, the model) is unchanged.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from apple_ecg import AppleECG, apply_qrs_polarity   # reuse container + polarity
-from rates import APPLE_FS
+APPLE_FS = 512
 
 PT_PER_MM = 72.0 / 25.4                    # 1 mm in PDF points  (~2.8346)
 APPLE_RED = (0.8039216, 0.03921569, 0.1254902)
 _NUM = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+@dataclass
+class AppleECG:
+    """One Apple Watch PDF recording after vector-trace recovery."""
+
+    signal_uv: np.ndarray
+    fs: int
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def duration_s(self) -> float:
+        return len(self.signal_uv) / self.fs
+
+    @property
+    def classification(self) -> str:
+        return self.meta.get("Classification", "")
+
+
+def _dominant_beats(x: np.ndarray, fs: int) -> np.ndarray:
+    absx = np.abs(x)
+    thr = np.percentile(absx, 90)
+    refr = max(1, int(0.28 * fs))
+    peaks, i, n = [], 0, len(x)
+    while i < n:
+        if absx[i] >= thr:
+            j = min(n, i + refr)
+            peaks.append(i + int(np.argmax(absx[i:j])))
+            i = peaks[-1] + refr
+        else:
+            i += 1
+    return np.asarray(peaks, dtype=int)
+
+
+def qrs_is_upright(signal: np.ndarray, fs: int) -> bool:
+    x = np.asarray(signal, dtype=float)
+    x = x - np.median(x)
+    if len(x) < int(0.5 * fs):
+        return True
+    beats = _dominant_beats(x, fs)
+    if len(beats) >= 3:
+        return float(np.median(x[beats])) >= 0.0
+    return np.percentile(x, 99.5) >= -np.percentile(x, 0.5)
+
+
+def apply_qrs_polarity(signal: np.ndarray, fs: int) -> tuple[np.ndarray, bool]:
+    if qrs_is_upright(signal, fs):
+        return signal, False
+    med = float(np.median(signal))
+    return (2.0 * med - signal), True
 
 
 def _match_color(c, ref, tol=0.04):
